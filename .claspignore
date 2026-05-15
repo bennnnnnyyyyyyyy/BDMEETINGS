@@ -1,0 +1,19 @@
+# Ignore everything by default (we only want specific .js code to upload to Apps Script)
+**/**
+
+# Exceptions (Allow these to upload)
+!*.js
+!*.ts
+!*.gs
+!appsscript.json
+
+# Explicitly ignore non-web scripts and standard environment files
+node_modules/**
+docs/**
+data/**
+auth/**
+archive/**
+sync-sheet.js
+package.json
+package-lock.json
+jsconfig.json
