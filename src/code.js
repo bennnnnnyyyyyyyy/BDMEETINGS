@@ -87,27 +87,27 @@ function onEdit(e) {
   if (!e || !e.source || !e.range) return;
   // Handle multi-row paste in Column C
   if (e.range.getHeight() > 1 || e.range.getWidth() > 1) {
-  // Only care if the paste touches Column C
-  const pasteStartCol = e.range.getColumn();
-  const pasteEndCol = pasteStartCol + e.range.getWidth() - 1;
+    // Only care if the paste touches Column C
+    const pasteStartCol = e.range.getColumn();
+    const pasteEndCol = pasteStartCol + e.range.getWidth() - 1;
 
-  if (pasteStartCol <= CONFIG.moveTriggerColumn && pasteEndCol >= CONFIG.moveTriggerColumn) {
-    const pasteStartRow = e.range.getRow();
-    const pasteHeight = e.range.getHeight();
-    const colOffset = CONFIG.moveTriggerColumn - pasteStartCol;
+    if (pasteStartCol <= CONFIG.moveTriggerColumn && pasteEndCol >= CONFIG.moveTriggerColumn) {
+      const pasteStartRow = e.range.getRow();
+      const pasteHeight = e.range.getHeight();
+      const colOffset = CONFIG.moveTriggerColumn - pasteStartCol;
 
-    // Read all pasted values in Column C in one batch call
-    const pastedValues = e.range.getValues();
+      // Read all pasted values in Column C in one batch call
+      const pastedValues = e.range.getValues();
 
-    for (let i = 0; i < pasteHeight; i++) {
-      const row = pasteStartRow + i;
-      if (row === 1) continue; // skip header
-      const val = pastedValues[i][colOffset];
-      if (val) queueRowMovement(e.range.getSheet().getName(), row, val);
+      for (let i = 0; i < pasteHeight; i++) {
+        const row = pasteStartRow + i;
+        if (row === 1) continue; // skip header
+        const val = pastedValues[i][colOffset];
+        if (val) queueRowMovement(e.range.getSheet().getName(), row, val);
+      }
     }
+    return; // still skip non-Column-C multi-cell edits
   }
-  return; // still skip non-Column-C multi-cell edits
-}
   const editedRange = e.range;
   const editedSheet = editedRange.getSheet();
   const col = editedRange.getColumn();
@@ -171,7 +171,7 @@ function queueRowMovement(sheetName, row, dropdownValue) {
         Logger.log(`Queue key already exists for ${sheetName} Row ${row} with same value — preserving original timestamp.`);
         return;
       }
-    } catch (_) {}
+    } catch (_) { }
   }
 
   props.setProperty(key, JSON.stringify(queueData));
@@ -422,8 +422,8 @@ function handleEmailNotification(sheet, range) {
   const notes = escapeHtml(rowData[CONFIG.notesColumn - 1]) || '(No notes)';
 
   const subject = `BD MEETINGS: Note Update for ${company}`;
-    // Replace all newline characters (\n) with HTML break tags (<br>)
-  const formattedNotes = notes.replace(/\n/g, '<br>');  
+  // Replace all newline characters (\n) with HTML break tags (<br>)
+  const formattedNotes = notes.replace(/\n/g, '<br>');
   const htmlBody = `
     <html>
       <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
@@ -1085,7 +1085,7 @@ function findStuckRows() {
       const triggerValue = String(row[triggerCol - 1] || '').trim();
       const company = String(row[companyCol - 1] || '').trim();
 
-      if (triggerValue && destinationMap[triggerValue]) {
+      if (triggerValue && destinationMap[triggerValue] && destinationMap[triggerValue] !== sheetName) {
         stuck.push(`  • "${sheetName}" Row ${i + 2} → should move to "${destinationMap[triggerValue]}" | Company: ${company || '(empty)'}`);
       }
     });
