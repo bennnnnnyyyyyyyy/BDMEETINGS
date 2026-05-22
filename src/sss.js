@@ -5,7 +5,7 @@ function setupDailyTriggers() {
     for (var i = 0; i < allTriggers.length; i++) {
       var h = safeCall(function () { return allTriggers[i].getHandlerFunction(); });
       if (h === 'codexProjectSummary' || h === 'codexListTriggers') {
-        try { ScriptApp.deleteTrigger(allTriggers[i]); } catch(e) {}
+        try { ScriptApp.deleteTrigger(allTriggers[i]); } catch (e) { }
       }
     }
     ScriptApp.newTrigger('codexProjectSummary').timeBased().everyDays(1).atHour(16).create();
@@ -19,7 +19,7 @@ function codexListTriggers() {
   return {
     ok: true,
     projectId: ScriptApp.getScriptId(),
-    projectTimeZone: safeCall(function() { return Session.getScriptTimeZone(); }) || 'Unknown',
+    projectTimeZone: safeCall(function () { return Session.getScriptTimeZone(); }) || 'Unknown',
     triggerCount: triggers.length,
     triggers: triggers.map(function (trigger) {
       return {
@@ -36,7 +36,7 @@ function codexProjectSummary() {
   return {
     ok: true,
     projectId: ScriptApp.getScriptId(),
-    projectTimeZone: safeCall(function() { return Session.getScriptTimeZone(); }) || 'Unknown',
+    projectTimeZone: safeCall(function () { return Session.getScriptTimeZone(); }) || 'Unknown',
     triggerCount: triggers.length,
     handlers: uniqueValues_(triggers.map(function (trigger) {
       return safeCall(function () { return trigger.getHandlerFunction(); }) || 'UNKNOWN_HANDLER';
