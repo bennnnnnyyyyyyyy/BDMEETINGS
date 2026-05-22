@@ -1065,7 +1065,11 @@ function findStuckRows() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const ui = SpreadsheetApp.getUi();
   const destinationMap = getDestinationMap();
-  const stuck = [];
+
+  // stuckMeta stores structured data for direct processing
+  const stuckMeta = [];
+  // stuckLines stores display strings for the alert preview
+  const stuckLines = [];
 
   CONFIG.activeSheets.forEach(sheetName => {
     const sheet = ss.getSheetByName(sheetName);
@@ -1076,39 +1080,108 @@ function findStuckRows() {
 
     const triggerCol = CONFIG.moveTriggerColumn;
     const companyCol = CONFIG.companyNameColumn;
+    const lastCol = sheet.getLastColumn();
+    const maxCol = Math.max(triggerCol, companyCol, lastCol);
 
-    // Batch read both columns at once
-    const maxCol = Math.max(triggerCol, companyCol);
+    // Batch read the full row so we have data ready if we need to move
     const data = sheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
 
     data.forEach((row, i) => {
       const triggerValue = String(row[triggerCol - 1] || '').trim();
       const company = String(row[companyCol - 1] || '').trim();
+      const targetName = destinationMap[triggerValue];
 
-      if (triggerValue && destinationMap[triggerValue] && destinationMap[triggerValue] !== sheetName) {
-        stuck.push(`  • "${sheetName}" Row ${i + 2} → should move to "${destinationMap[triggerValue]}" | Company: ${company || '(empty)'}`);
+      if (triggerValue && targetName && targetName !== sheetName) {
+        const rowNum = i + 2; // 1-indexed sheet row
+        stuckMeta.push({ sheetName, sheet, rowNum, targetName, rowData: row });
+        stuckLines.push(`  • "${sheetName}" Row ${rowNum} → "${targetName}" | Company: ${company || '(empty)'}`);
       }
     });
   });
 
-  if (stuck.length === 0) {
+  if (stuckMeta.length === 0) {
     ui.alert('✅ No Stuck Rows', 'All rows with dropdown values have been processed. Nothing is stuck.', ui.ButtonSet.OK);
     return;
   }
 
-  const preview = stuck.slice(0, 15).join('\n');
-  const extra = stuck.length > 15 ? `\n\n...and ${stuck.length - 15} more.` : '';
+  const preview = stuckLines.slice(0, 15).join('\n');
+  const extra = stuckMeta.length > 15 ? `\n\n...and ${stuckMeta.length - 15} more.` : '';
 
   const response = ui.alert(
-    `⚠️ ${stuck.length} Stuck Row(s) Found`,
+    `⚠️ ${stuckMeta.length} Stuck Row(s) Found`,
     `The following rows have a move dropdown set but haven't been processed:\n\n${preview}${extra}\n\nWould you like to process them now?`,
     ui.ButtonSet.YES_NO
   );
 
-  if (response === ui.Button.YES) {
-    processBatchRowMovement();
-    ui.alert('✅ Done', 'Stuck rows have been processed. Check the Activity Log for details.', ui.ButtonSet.OK);
+  if (response !== ui.Button.YES) return;
+
+  // --- Direct targeted processing (no full re-scan, no timeout risk) ---
+  let movedCount = 0;
+  let skippedDup = 0;
+  let errorCount = 0;
+
+  // Process bottom-to-top per sheet so row deletions don't shift indices
+  // Group by sheet first, then sort descending by rowNum
+  const bySheet = {};
+  stuckMeta.forEach(item => {
+    if (!bySheet[item.sheetName]) bySheet[item.sheetName] = [];
+    bySheet[item.sheetName].push(item);
+  });
+
+  for (const sheetName in bySheet) {
+    const items = bySheet[sheetName].sort((a, b) => b.rowNum - a.rowNum); // bottom-to-top
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) continue;
+
+    for (const item of items) {
+      try {
+        const targetSheet = ss.getSheetByName(item.targetName);
+        if (!targetSheet) {
+          Logger.log(`Target sheet "${item.targetName}" not found. Skipping row ${item.rowNum}.`);
+          errorCount++;
+          continue;
+        }
+
+        // Re-read the live row to avoid stale data after previous deletions
+        const lastCol = sheet.getLastColumn();
+        const liveRowData = sheet.getRange(item.rowNum, 1, 1, lastCol).getValues()[0];
+
+        // Duplicate check (skip if either sheet is ignored)
+        let isDup = { found: false };
+        if (!isSheetIgnored(sheetName) && !isSheetIgnored(item.targetName)) {
+          isDup = checkForDuplicates(
+            ss,
+            liveRowData[CONFIG.companyNameColumn - 1],
+            liveRowData[CONFIG.phoneColumn - 1],
+            liveRowData[CONFIG.emailColumn - 1],
+            sheetName,
+            item.rowNum
+          );
+        }
+
+        if (isDup.found) {
+          Logger.log(`Duplicate found for row ${item.rowNum} in ${sheetName}. Move to ${item.targetName} cancelled.`);
+          skippedDup++;
+          continue;
+        }
+
+        archiveDeletedRow(ss, sheetName, item.rowNum, liveRowData);
+        targetSheet.appendRow(liveRowData);
+        sheet.deleteRow(item.rowNum);
+        movedCount++;
+
+        logActivity('Stuck Row Fixed', `${sheetName} → ${item.targetName} | Company: ${liveRowData[CONFIG.companyNameColumn - 1]}`);
+      } catch (err) {
+        Logger.log(`Error processing stuck row ${item.rowNum} in ${sheetName}: ${err.message}`);
+        errorCount++;
+      }
+    }
   }
+
+  let summary = `✅ Done — ${movedCount} row(s) moved.`;
+  if (skippedDup > 0) summary += `\n⚠️ ${skippedDup} skipped (duplicate detected).`;
+  if (errorCount > 0) summary += `\n❌ ${errorCount} error(s) — check Execution Logs.`;
+  ui.alert('Stuck Rows Processed', summary, ui.ButtonSet.OK);
 }
 
 
