@@ -13,44 +13,10 @@ So "integrating the email system" means: **Saleoo needs to create/update rows in
 
 ## 2. Two integration paths — pick one with us before building
 
-|
- Path 
-|
- How it works 
-|
- Effort 
-|
-|
----
-|
----
-|
----
-|
-|
-**
-A. Google Sheets API (recommended)
-**
-|
- Saleoo uses a Google service account with edit access to the Sheet, and calls 
-`spreadsheets.values.append`
- / 
-`update`
- directly. 
-|
- Low — no changes to our script needed. 
-|
-|
-**
-B. Apps Script Web App
-**
-|
- We deploy a small 
-`doPost(e)`
- endpoint in this same Apps Script project that accepts a JSON payload from Saleoo and writes the row for it. 
-|
- Medium — requires us to add and deploy a new endpoint (not present today). 
-|
+| Path | How it works | Effort |
+|---|---|---|
+| **A. Google Sheets API (recommended)** | Saleoo uses a Google service account with edit access to the Sheet, and calls `spreadsheets.values.append` / `update` directly. | Low — no changes to our script needed. |
+| **B. Apps Script Web App** | We deploy a small `doPost(e)` endpoint in this same Apps Script project that accepts a JSON payload from Saleoo and writes the row for it. | Medium — requires us to add and deploy a new endpoint (not present today). |
 
 If Saleoo wants a real HTTP API instead of writing to Sheets directly, **tell us** — Path B needs a new deployment on our end, listed in section 6 below. The rest of this document assumes Path A unless we agree otherwise.
 
@@ -67,89 +33,17 @@ New leads from Saleoo should be appended as new rows in **"New Meetings"**.
 
 ### Column map (1-indexed, fixed — do not shift these)
 
-|
- Col 
-|
- Field 
-|
- Notes 
-|
-|
----
-|
----
-|
----
-|
-|
- B 
-|
- Opener 
-|
- Must exactly match a name configured on our side (see §4). Determines who gets emailed. 
-|
-|
- C 
-|
- Move Trigger 
-|
- Dropdown status value (see §5). Leave blank on initial insert. 
-|
-|
- E 
-|
- Company Name 
-|
- Used in email subject/body and duplicate checks. 
-|
-|
- F 
-|
- Authorized/Contact Person 
-|
-|
-|
- G 
-|
- Phone 
-|
- Used in duplicate detection. 
-|
-|
- H 
-|
- Email 
-|
- Lead's email — used in duplicate detection, 
-**
-not
-**
- the recipient of internal notifications. 
-|
-|
- I 
-|
- Meeting Date/Time 
-|
- Required only if a meeting will be scheduled — must be a real future datetime, not text. 
-|
-|
- K 
-|
- Notes 
-|
- Editing this column is what fires the "Note Update" email to the Opener. 
-|
-|
- O 
-|
- Schedule checkbox 
-|
-`TRUE`
-/checked + a valid date in column I = triggers a Calendar invite when 
-`scheduleSelectedMeetings()`
- runs. 
-|
+| Col | Field | Notes |
+|---|---|---|
+| B | Opener | Must exactly match a name configured on our side (see §4). Determines who gets emailed. |
+| C | Move Trigger | Dropdown status value (see §5). Leave blank on initial insert. |
+| E | Company Name | Used in email subject/body and duplicate checks. |
+| F | Authorized/Contact Person | |
+| G | Phone | Used in duplicate detection. |
+| H | Email | Lead's email — used in duplicate detection, **not** the recipient of internal notifications. |
+| I | Meeting Date/Time | Required only if a meeting will be scheduled — must be a real future datetime, not text. |
+| K | Notes | Editing this column is what fires the "Note Update" email to the Opener. |
+| O | Schedule checkbox | `TRUE`/checked + a valid date in column I = triggers a Calendar invite when `scheduleSelectedMeetings()` runs. |
 
 Columns A, D, J, L, M, N are either spacers or used internally (e.g. M = "Last Call" timestamp, auto-set by the script) — Saleoo should leave them blank.
 
@@ -173,61 +67,17 @@ Jasmine → jasmine.green.wiz@gmail.com
 
 These are the only values the system recognizes for moving a row between tabs (configured in the sheet's own "Settings" tab):
 
-|
- Value Saleoo writes to Column C 
-|
- Row moves to 
-|
-|
----
-|
----
-|
-|
-`Onboarded`
-|
- Onboarded 
-|
-|
-`Follow Up`
-|
- Follow Ups 
-|
-|
-`Meeting Attended`
-|
- Follow Ups 
-|
-|
-`No - Show / Callback`
-|
- No-Show 
-|
-|
-`NI`
-|
- Dead Leads 
-|
-|
-`DNC`
-|
- Dead Leads 
-|
-|
-`No Medicare`
-|
- Dead Leads 
-|
-|
-`Contract Sent`
-|
- Contract Sent 
-|
-|
-`Pending Medicare`
-|
- Temporary Inactive 
-|
+| Value Saleoo writes to Column C | Row moves to |
+|---|---|
+| `Onboarded` | Onboarded |
+| `Follow Up` | Follow Ups |
+| `Meeting Attended` | Follow Ups |
+| `No - Show / Callback` | No-Show |
+| `NI` | Dead Leads |
+| `DNC` | Dead Leads |
+| `No Medicare` | Dead Leads |
+| `Contract Sent` | Contract Sent |
+| `Pending Medicare` | Temporary Inactive |
 
 Any other value in column C is ignored by the row-mover (no error, no movement). If Saleoo introduces new lead statuses, they need a corresponding row added to the Settings tab — talk to us before relying on a new value.
 
@@ -256,6 +106,5 @@ Before a row is moved between tabs, the script checks company name + phone + ema
 
 - It does not send a "lead received" confirmation email to the lead itself — only internal notifications to the Opener.
 - It does not expose any way for Saleoo to read data back out (no "get lead status" call). Status changes are one-directional, Saleoo → Sheet.
-- It does not validate email addres
-
-Want to be notified when Claude responds?
+- It does not validate email addresses or phone formats before sending.
+- It is timezone-bound to `Africa/Cairo` for all date/trigger logic — send datetimes accordingly or be explicit about timezone in your payload.
