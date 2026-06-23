@@ -67,7 +67,8 @@ function setupScriptProperties() {
       'Ben': 'ben.arthur.wiz@gmail.com',
       'Jane': 'kaity.james.wiz@gmail.com',
       'Jimmy': 'jimmy.pearson.wiz@gmail.com',
-      'Selene': 'selene.myles.wiz@gmail.com'
+      'Selene': 'selene.myles.wiz@gmail.com',
+      'Jasmine' : 'jasmine.green.wiz@gmail.com'
     })
   });
   SpreadsheetApp.getUi().alert('✅ Script properties configured successfully.');
