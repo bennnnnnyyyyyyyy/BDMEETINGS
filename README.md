@@ -1,57 +1,18 @@
-# Integrating Saleoo with the BD Meetings Email/Calendar System
+# BD Meetings → Saleoo Migration Spec: Email & Notification Logic
 
-This document explains how the internal "BD Meetings" automation works and exactly what Saleoo needs to do to plug into it. Read this fully before writing any code — this is **not** a REST API. There is no endpoint to call. It is a Google Sheet with an Apps Script automation layer attached to it, and integration means writing rows into that sheet in the right shape.
+## Purpose of this document
 
-## 1. What this system actually is
+This is **not** an integration guide. The Google Sheet + Apps Script system ("BD Meetings") is being retired. Saleoo is becoming the system of record for leads, replacing the Sheet entirely. The Sheet may stick around afterward only as a read-only export/archive — it won't drive any logic anymore.
 
-BD Meetings is a Google Apps Script project (`BDMEETINGS` repo) bound to a single Google Sheet. There is no server, no public URL, and no webhook receiver. All automation is triggered by:
+This document exists so the Saleoo developer can **rebuild the same email-notification behavior natively in Saleoo**, since that behavior currently only exists buried in Apps Script (`code.js`) and was never written down anywhere else. Nothing here needs to be "integrated" with the old system — it needs to be **reimplemented** inside Saleoo, then the old Sheet/script gets switched off.
 
-- **`onEdit(e)`** — fires instantly when a cell in the sheet is edited (by a human or by the Sheets API)
-- **Time-based triggers** — `processQueuedMovements` (every ~1 min), `processBatchEmails` (every ~10 min), `processBatchRowMovement` (every ~5 min, backup pass)
+Calendar invites are explicitly **out of scope for now** — no auto-calendar-invite feature needs to be rebuilt at this stage.
 
-So "integrating the email system" means: **Saleoo needs to create/update rows in this Sheet with the correct columns populated**, and the existing script will pick them up, send emails via `MailApp.sendEmail()`, and create Calendar invites via `CalendarApp.createEvent()` automatically. Saleoo does not send emails directly — it triggers our automation by writing data, and our automation sends the email.
+## 1. The core concept: notifications are addressed by "Opener," not by lead
 
-## 2. Two integration paths — pick one with us before building
+Every lead row has an **Opener** — the rep who owns that lead. All notification emails go to the Opener, not to the lead's own email address (the lead's email is only used for duplicate-detection, never as a send target in this system).
 
-| Path | How it works | Effort |
-|---|---|---|
-| **A. Google Sheets API (recommended)** | Saleoo uses a Google service account with edit access to the Sheet, and calls `spreadsheets.values.append` / `update` directly. | Low — no changes to our script needed. |
-| **B. Apps Script Web App** | We deploy a small `doPost(e)` endpoint in this same Apps Script project that accepts a JSON payload from Saleoo and writes the row for it. | Medium — requires us to add and deploy a new endpoint (not present today). |
-
-If Saleoo wants a real HTTP API instead of writing to Sheets directly, **tell us** — Path B needs a new deployment on our end, listed in section 6 below. The rest of this document assumes Path A unless we agree otherwise.
-
-## 3. The sheet structure Saleoo must write to
-
-The spreadsheet has multiple tabs ("stages"). Only these are active and processed by the script — anything else is ignored:
-
-```
-New Meetings, Follow Ups, No-Show, Contract Sent,
-Invoice Sent, Dead Leads, Temporary Inactive, Onboarded
-```
-
-New leads from Saleoo should be appended as new rows in **"New Meetings"**.
-
-### Column map (1-indexed, fixed — do not shift these)
-
-| Col | Field | Notes |
-|---|---|---|
-| B | Opener | Must exactly match a name configured on our side (see §4). Determines who gets emailed. |
-| C | Move Trigger | Dropdown status value (see §5). Leave blank on initial insert. |
-| E | Company Name | Used in email subject/body and duplicate checks. |
-| F | Authorized/Contact Person | |
-| G | Phone | Used in duplicate detection. |
-| H | Email | Lead's email — used in duplicate detection, **not** the recipient of internal notifications. |
-| I | Meeting Date/Time | Required only if a meeting will be scheduled — must be a real future datetime, not text. |
-| K | Notes | Editing this column is what fires the "Note Update" email to the Opener. |
-| O | Schedule checkbox | `TRUE`/checked + a valid date in column I = triggers a Calendar invite when `scheduleSelectedMeetings()` runs. |
-
-Columns A, D, J, L, M, N are either spacers or used internally (e.g. M = "Last Call" timestamp, auto-set by the script) — Saleoo should leave them blank.
-
-**Row 1 is always the header row and must never be overwritten.**
-
-## 4. Who gets emailed — the Opener map
-
-Emails are addressed by **Opener name**, not by lead email. The mapping of Opener → internal email address lives in Apps Script's Script Properties on our side (not in the sheet, not visible to Saleoo):
+Today, the Opener → email mapping is a hardcoded lookup table:
 
 ```
 Ben     → ben.arthur.wiz@gmail.com
@@ -61,50 +22,66 @@ Selene  → selene.myles.wiz@gmail.com
 Jasmine → jasmine.green.wiz@gmail.com
 ```
 
-**Action for Saleoo:** whatever field in Saleoo represents the assigned rep/owner must be mapped to one of these exact names before being written to column B. If the name doesn't match exactly (case-sensitive-ish, trimmed), the script silently skips sending the email and just logs it — no error is raised back to Saleoo. If Saleoo needs new openers added, tell us and we'll add them to the map; this can't be self-served from the sheet.
+**What needs to change:** these can no longer be personal Gmail addresses. Saleoo will send via either an `@prime-ad` domain address or through Cloudflare/Supabase's email-sending service — the developer will decide which sending mechanism to use. But the *mapping concept* must be preserved: **whatever lead is assigned to whatever Opener/rep determines which address the notification email is sent to (and likely sent from)**. This Opener-keyed lookup is the one piece of logic that has to survive the migration unchanged — only the underlying addresses and transport mechanism change.
 
-## 5. Status values that drive row movement (column C)
+If Saleoo already has its own concept of "assigned rep" or "owner" per lead, that field should replace "Opener" directly — same role, new name.
 
-These are the only values the system recognizes for moving a row between tabs (configured in the sheet's own "Settings" tab):
+## 2. When an email actually fires today (the trigger logic to replicate)
 
-| Value Saleoo writes to Column C | Row moves to |
+This is the part that's easy to get wrong because it's spread across several functions. There are exactly two triggers for sending a notification email in the current system:
+
+### Trigger A — Notes field updated on a lead
+
+When the "Notes" field on a lead is edited:
+1. A timestamp ("Last Call") is recorded on that lead.
+2. The update is queued (not sent immediately).
+3. **Throttle:** if a notification was already sent for that same lead within the last **5 minutes**, the new one is silently dropped — no email, no error, no retry. This prevents spam when someone edits notes repeatedly in a short window.
+4. If not throttled, a batch job picks up the queued update (today this runs every ~10 minutes; doesn't have to be a batch in Saleoo, can be immediate) and sends an email to that lead's Opener containing: company name, contact person, phone, lead email, and the notes content.
+5. **Auto-CC rule:** if the word "contract", "prices", or "ben" (case-insensitive) appears anywhere in the company name or notes text, an admin address is automatically CC'd on top of the Opener. Today that's `ben.arthur.wiz@gmail.com` — this should become whatever the equivalent admin/owner address is in the new setup.
+
+### Trigger B — Lead status changes (column "Move Trigger" in the old sheet)
+
+When a lead's status changes to one of a fixed set of values, the lead is reclassified, but **no email is sent purely for the status change itself in the current system** — the move is silent. Only Trigger A (notes) sends email. If Saleoo wants status-change notifications too, that's a *new* feature, not something to port over — flag it as a decision point, don't assume it's required.
+
+The status values that exist today (for reference, in case Saleoo's pipeline stages need to map to these):
+
+| Status value | Maps to pipeline stage |
 |---|---|
-| `Onboarded` | Onboarded |
-| `Follow Up` | Follow Ups |
-| `Meeting Attended` | Follow Ups |
-| `No - Show / Callback` | No-Show |
-| `NI` | Dead Leads |
-| `DNC` | Dead Leads |
-| `No Medicare` | Dead Leads |
-| `Contract Sent` | Contract Sent |
-| `Pending Medicare` | Temporary Inactive |
+| Onboarded | Onboarded |
+| Follow Up | Follow Ups |
+| Meeting Attended | Follow Ups |
+| No - Show / Callback | No-Show |
+| NI | Dead Leads |
+| DNC | Dead Leads |
+| No Medicare | Dead Leads |
+| Contract Sent | Contract Sent |
+| Pending Medicare | Temporary Inactive |
 
-Any other value in column C is ignored by the row-mover (no error, no movement). If Saleoo introduces new lead statuses, they need a corresponding row added to the Settings tab — talk to us before relying on a new value.
+## 3. Duplicate detection logic to preserve
 
-## 6. What actually sends an email (and what doesn't)
+Before any lead is reclassified/moved, the old system checks for duplicates using a composite key: **company name + phone + email must ALL match exactly** against another existing lead. Partial matches (e.g. same company, different phone) are intentionally NOT flagged as duplicates. If Saleoo already has its own duplicate detection, just confirm it uses the same all-three-fields-must-match rule rather than fuzzy/partial matching — that was a deliberate choice in the original system, not an oversight.
 
-- Writing a new lead row → **no email**. This just gets it into the pipeline.
-- Editing column K (Notes) on an existing row → triggers a "Note Update" email to that row's Opener, with company/contact/phone/email/notes in an HTML table. This is throttled to once every 5 minutes per row.
-- Setting the column O checkbox to `TRUE` with a valid future date in column I → creates a Google Calendar event and **sends a calendar invite** (via `sendInvites: true`) to the Opener and a fixed always-included guest. This only runs when someone manually runs `scheduleSelectedMeetings()` from the Sheet's menu — it is not automatic on edit.
-- If "contract", "prices", or "ben" appears in the company/notes text, the admin (`ben.arthur.wiz@gmail.com`) is auto-CC'd on the notification email.
+## 4. What's explicitly NOT being carried over right now
 
-**Important:** if Saleoo's integration writes to column K programmatically expecting an email to fire immediately, be aware of the 5-minute throttle and the fact that the actual send happens on the next `processBatchEmails` run (every ~10 minutes), not instantly.
+- **No calendar invites.** The old system could create a Google Calendar event with an invite when a checkbox was ticked. This is being dropped for now — do not build this unless asked again later.
+- **No lead-facing emails.** The lead never receives anything automatically in the current system — only internal Opener/admin notifications. Don't add lead-facing emails unless that's a separate, explicit ask.
+- **No read-back into the old sheet.** This isn't a two-way sync. Saleoo becomes the source of truth; the Sheet (if kept at all) is just a historical export, not something Saleoo needs to write to or read from going forward.
 
-## 7. Duplicate protection Saleoo should know about
+## 5. Open items for the Saleoo developer to decide/figure out
 
-Before a row is moved between tabs, the script checks company name + phone + email against other active tabs. **All three must match exactly** for it to count as a duplicate — partial matches are allowed through. This only runs on row *movement*, not on initial insert, so Saleoo can safely push the same lead multiple times into "New Meetings" without it being auto-blocked at that stage; dedup only kicks in once a status change tries to move it.
+These were intentionally left open and don't need to be locked down before starting:
 
-## 8. What we need from Saleoo before this can be wired up
+- Whether sending goes through classic SMTP on `@prime-ad`, or through Cloudflare/Supabase's email-sending service instead.
+- Whether each Opener gets a distinct sending identity or there's a shared sender with a "from name" set per Opener — not yet decided on our end either.
+- Whether the 5-minute throttle and ~10-minute batching are reproduced as-is, or just replaced with sane equivalents (e.g. a per-lead debounce) — the old timing was a workaround for Apps Script's trigger limitations, not a deliberate business requirement, so it doesn't need to be copied exactly.
 
-1. Confirm which path (§2) Saleoo's engineer wants — direct Sheets API writes, or a hosted endpoint we build.
-2. Confirm how Saleoo will determine the "Opener" value per lead, and confirm it can be mapped 1:1 to the five names in §4 (or tell us what new names/emails to add).
-3. Confirm date/time format Saleoo will send for column I — must parse cleanly into a JS `Date`.
-4. If using Path A: Saleoo shares the service account email they'll authenticate with, so we can share Edit access to the specific Sheet.
-5. If using Path B: give us a few days — `doPost` isn't implemented yet and needs a new Apps Script deployment + URL handoff.
+## 6. Quick checklist for "have we hit feature parity on email logic"
 
-## 9. Things this system explicitly does NOT do (don't assume these)
-
-- It does not send a "lead received" confirmation email to the lead itself — only internal notifications to the Opener.
-- It does not expose any way for Saleoo to read data back out (no "get lead status" call). Status changes are one-directional, Saleoo → Sheet.
-- It does not validate email addresses or phone formats before sending.
-- It is timezone-bound to `Africa/Cairo` for all date/trigger logic — send datetimes accordingly or be explicit about timezone in your payload.
+- [ ] Each lead has an Opener/owner field that resolves to a real sending/receiving address (no longer Gmail)
+- [ ] Editing a lead's notes triggers a notification to that lead's Opener
+- [ ] A reasonable throttle/debounce exists so rapid edits don't spam multiple emails
+- [ ] Notification includes company, contact, phone, lead email, and notes content
+- [ ] Admin gets auto-CC'd when "contract," "prices," or "ben" appears in company/notes (or updated equivalent keyword/address)
+- [ ] Duplicate check uses exact match on all three of company + phone + email before blocking a status move
+- [ ] No calendar invite logic is being built right now
+- [ ] No emails are sent to the lead themselves
