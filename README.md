@@ -1,5 +1,5 @@
 # BD Meetings → Saleoo Migration Spec: Email & Notification Logic
-
+(Main BD MEETINGS SPREADSHEET) [https://docs.google.com/spreadsheets/d/1uicpBruuFeno2ES4hNw-TIAwNkGEI37gw8Z-A4yMpC8/edit?usp=sharing]
 ## Purpose of this document
 
 This is **not** an integration guide. The Google Sheet + Apps Script system ("BD Meetings") is being retired. Saleoo is becoming the system of record for leads, replacing the Sheet entirely. The Sheet may stick around afterward only as a read-only export/archive — it won't drive any logic anymore.
