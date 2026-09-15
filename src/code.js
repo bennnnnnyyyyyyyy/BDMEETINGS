@@ -855,6 +855,7 @@ function processBatchEmails() {
  */
 function processBatchRowMovement() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
   const destinationMap = getDestinationMap(); // FIX #12: loaded once
   const sheets = ss.getSheets();
   let movedCount = 0;
