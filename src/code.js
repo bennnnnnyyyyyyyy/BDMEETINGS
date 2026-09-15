@@ -68,7 +68,8 @@ function setupScriptProperties() {
       'Jane': 'kaity.james.wiz@gmail.com',
       'Jimmy': 'jimmy.pearson.wiz@gmail.com',
       'Selene': 'selene.myles.wiz@gmail.com',
-      'Jasmine' : 'jasmine.green.wiz@gmail.com'
+      'Jasmine': 'jasmine.green.wiz@gmail.com',
+      'Nora': 'nora.atkins.wiz@gmail.com',
     })
   });
   SpreadsheetApp.getUi().alert('✅ Script properties configured successfully.');
@@ -322,6 +323,11 @@ function handleRowMovement(sheet, range, ss, val, destinationMap) {
     return;
   }
 
+  // Cancel any pending email notification for this row — the row is about to be
+  // deleted, so its old index will point to the wrong row after the shift.
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(`BATCH_UPDATE|${currentSheetName}|${row}`);
+
   archiveDeletedRow(ss, currentSheetName, row, rowData);
   targetSheet.appendRow(rowData);
   sheet.deleteRow(row);
@@ -474,7 +480,7 @@ function handleEmailNotification(sheet, range) {
   `;
   const plainTextBody = `Note update for ${rowData[CONFIG.companyNameColumn - 1] || ''}. Notes: ${rowData[CONFIG.notesColumn - 1] || ''}`;
   const contentToSearch = `${subject} ${plainTextBody}`;
-  const shouldCcBen = /\b(contract|prices|ben)\b/i.test(contentToSearch) || /\@ben/i.test(contentToSearch);
+  const shouldCcBen = /\b(ben)\b/i.test(contentToSearch) || /\@ben/i.test(contentToSearch);
 
   try {
     MailApp.sendEmail({
@@ -924,6 +930,9 @@ function processBatchRowMovement() {
             Logger.log(`Duplicate found for row ${row} in ${sheetName}. Move to ${targetName} cancelled.`);
             continue;
           }
+
+          // Cancel any pending email for this row — stale index would email wrong lead
+          props.deleteProperty(`BATCH_UPDATE|${sheetName}|${row}`);
 
           archiveDeletedRow(ss, sheetName, row, liveRowData);
           targetSheet.appendRow(liveRowData);
