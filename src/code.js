@@ -1347,3 +1347,148 @@ function scheduleSecondTriggerBoot() {
 
   Logger.log('Offset trigger created. Bootstrap trigger deleted.');
 }
+
+// ==========================================
+// 🔗 PROSPECTOR SYNC
+// Reads rows with an NPI in Column Q that haven't
+// been synced yet (Column R blank), then claims
+// each lead in dmedesk-prospector under the opener's account.
+// Run on a 30-minute time-driven trigger.
+//
+// SCRIPT PROPERTIES REQUIRED:
+//   PROSPECTOR_WORKER_URL  → https://dmedesk-prospector-api.<account>.workers.dev
+//   PROSPECTOR_USER_<Opener> → that opener's prospector username
+//   PROSPECTOR_PASS_<Opener> → that opener's prospector password
+//   (e.g. PROSPECTOR_USER_Ben, PROSPECTOR_PASS_Ben)
+// ==========================================
+
+/**
+ * Syncs new NPI rows from BD Meetings to dmedesk-prospector.
+ * Logs in once per opener per run, claims all their pending NPIs in one batch.
+ */
+function syncNpiToProspector() {
+  const props = PropertiesService.getScriptProperties();
+  const workerUrl = (props.getProperty('PROSPECTOR_WORKER_URL') || '').replace(/\/$/, '');
+  if (!workerUrl) {
+    Logger.log('PROSPECTOR_WORKER_URL not set — skipping prospector sync');
+    return;
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const NPI_COL    = 17; // Column Q
+  const SYNC_COL   = 18; // Column R
+  const OPENER_COL =  2; // Column B
+  const COMPANY_COL = 5; // Column E
+  const PHONE_COL  =  7; // Column G
+  const BATCH_COL  = Math.max(NPI_COL, SYNC_COL, OPENER_COL, COMPANY_COL, PHONE_COL);
+
+  // Collect pending rows grouped by opener name
+  const byOpener = {};
+
+  CONFIG.activeSheets.forEach(function(sheetName) {
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet || sheet.getLastRow() < 2) return;
+
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, BATCH_COL).getValues();
+
+    data.forEach(function(row, i) {
+      const npi    = String(row[NPI_COL - 1]    || '').trim().replace(/\D/g, '');
+      const synced = String(row[SYNC_COL - 1]   || '').trim();
+      const opener = String(row[OPENER_COL - 1] || '').trim();
+
+      if (npi.length !== 10) return; // missing or invalid NPI
+      if (synced === 'SYNCED') return;  // already sent
+      if (!opener) return;              // no opener to claim under
+
+      if (!byOpener[opener]) byOpener[opener] = [];
+      byOpener[opener].push({
+        sheet:    sheet,
+        rowIndex: i + 2, // 1-indexed sheet row
+        npi:      npi,
+        company:  String(row[COMPANY_COL - 1] || ''),
+        phone:    String(row[PHONE_COL - 1]   || ''),
+      });
+    });
+  });
+
+  const openers = Object.keys(byOpener);
+  if (openers.length === 0) {
+    Logger.log('Prospector sync: no pending NPI rows found.');
+    return;
+  }
+
+  openers.forEach(function(opener) {
+    const username = props.getProperty('PROSPECTOR_USER_' + opener);
+    const password = props.getProperty('PROSPECTOR_PASS_' + opener);
+
+    if (!username || !password) {
+      Logger.log('Prospector sync: no credentials for opener "' + opener + '" — skipping ' + byOpener[opener].length + ' row(s)');
+      return;
+    }
+
+    // Step 1: Login as this opener
+    var token;
+    try {
+      var loginResp = UrlFetchApp.fetch(workerUrl + '/auth/login', {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({ username: username, password: password }),
+        muteHttpExceptions: true,
+      });
+      var loginJson = JSON.parse(loginResp.getContentText());
+      if (!loginJson.success) throw new Error(loginJson.error || 'login failed');
+      token = loginJson.data.token;
+    } catch (err) {
+      Logger.log('Prospector sync: login failed for "' + opener + '": ' + err.message);
+      return;
+    }
+
+    // Step 2: Claim all pending NPIs in one batch
+    var companies = byOpener[opener].map(function(r) {
+      return {
+        npi:           r.npi,
+        name:          r.company,
+        phone:         r.phone,
+        contactSource: 'bd-meetings',
+        sources:       'BD Meetings',
+      };
+    });
+
+    try {
+      var claimResp = UrlFetchApp.fetch(workerUrl + '/export/sheets', {
+        method: 'post',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + token },
+        payload: JSON.stringify({ companies: companies }),
+        muteHttpExceptions: true,
+      });
+      var claimJson = JSON.parse(claimResp.getContentText());
+      if (!claimJson.success) throw new Error(claimJson.error || 'claim failed');
+      Logger.log('Prospector sync: claimed ' + claimJson.data.rowsAdded + ' lead(s) for ' + opener);
+    } catch (err) {
+      Logger.log('Prospector sync: claim failed for "' + opener + '": ' + err.message);
+      return; // don't mark rows synced if the request failed
+    }
+
+    // Step 3: Mark rows as SYNCED in Column R
+    byOpener[opener].forEach(function(r) {
+      r.sheet.getRange(r.rowIndex, SYNC_COL).setValue('SYNCED');
+    });
+  });
+}
+
+/**
+ * One-time setup: creates the 30-minute time-driven trigger for syncNpiToProspector.
+ * Run manually once from the Apps Script editor.
+ */
+function setupProspectorSyncTrigger() {
+  // Remove any existing sync triggers first
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'syncNpiToProspector') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('syncNpiToProspector')
+    .timeBased()
+    .everyMinutes(30)
+    .create();
+  SpreadsheetApp.getUi().alert('✅ Prospector sync trigger created (runs every 30 minutes).');
+}
