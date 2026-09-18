@@ -352,6 +352,9 @@ function getDestinationMap() {
     if (row[0]) map[row[0].toString().trim()] = row[1].toString().trim();
   });
 
+  // Built-in: Rescheduled always goes back to New Meetings
+  if (!map['Rescheduled']) map['Rescheduled'] = 'New Meetings';
+
   return map;
 }
 /**
