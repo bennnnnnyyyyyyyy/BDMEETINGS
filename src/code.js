@@ -87,20 +87,16 @@ function setupScriptProperties() {
 // ==========================================
 function onEdit(e) {
   if (!e || !e.source || !e.range) return;
-  // Handle multi-row paste in Column C
+  // Handle multi-row paste in Column C (Status) or Column H (Email)
   if (e.range.getHeight() > 1 || e.range.getWidth() > 1) {
-    // Only care if the paste touches Column C
     const pasteStartCol = e.range.getColumn();
     const pasteEndCol = pasteStartCol + e.range.getWidth() - 1;
+    const pasteStartRow = e.range.getRow();
+    const pasteHeight = e.range.getHeight();
+    const pastedValues = e.range.getValues();
 
     if (pasteStartCol <= CONFIG.moveTriggerColumn && pasteEndCol >= CONFIG.moveTriggerColumn) {
-      const pasteStartRow = e.range.getRow();
-      const pasteHeight = e.range.getHeight();
       const colOffset = CONFIG.moveTriggerColumn - pasteStartCol;
-
-      // Read all pasted values in Column C in one batch call
-      const pastedValues = e.range.getValues();
-
       for (let i = 0; i < pasteHeight; i++) {
         const row = pasteStartRow + i;
         if (row === 1) continue; // skip header
@@ -108,7 +104,17 @@ function onEdit(e) {
         if (val) queueRowMovement(e.range.getSheet().getName(), row, val);
       }
     }
-    return; // still skip non-Column-C multi-cell edits
+
+    if (pasteStartCol <= CONFIG.emailColumn && pasteEndCol >= CONFIG.emailColumn) {
+      const emailColOffset = CONFIG.emailColumn - pasteStartCol;
+      for (let i = 0; i < pasteHeight; i++) {
+        const row = pasteStartRow + i;
+        if (row === 1) continue; // skip header
+        const emailVal = pastedValues[i][emailColOffset];
+        if (emailVal) queueCalendarSync(e.range.getSheet().getName(), row, emailVal);
+      }
+    }
+    return;
   }
   const editedRange = e.range;
   const editedSheet = editedRange.getSheet();
@@ -122,6 +128,16 @@ function onEdit(e) {
   // This ensures the key is written even if the lock wait below fails.
   if (col === CONFIG.moveTriggerColumn && val) {
     queueRowMovement(editedSheet.getName(), row, val);
+  }
+
+  // Queue and trigger calendar match when Email (Col H) is entered/edited
+  if (col === CONFIG.emailColumn && val) {
+    queueCalendarSync(editedSheet.getName(), row, val);
+    try {
+      syncMeetingTimeFromCalendar(editedSheet, row);
+    } catch (err) {
+      Logger.log(`onEdit direct calendar sync: ${err.message}`);
+    }
   }
 
   // Now acquire lock for the rest of the work
@@ -245,6 +261,22 @@ function processQueuedMovements() {
 
     } catch (error) {
       Logger.log(`Error processing queued movement ${key}: ${error.message}`);
+    } finally {
+      props.deleteProperty(key);
+    }
+  }
+
+  // Process queued calendar syncs
+  const calKeys = Object.keys(allProps).filter(k => k.startsWith("PENDING_CAL_SYNC|"));
+  for (const key of calKeys) {
+    try {
+      const syncData = JSON.parse(allProps[key]);
+      const targetSheet = ss.getSheetByName(syncData.sheetName);
+      if (targetSheet) {
+        syncMeetingTimeFromCalendar(targetSheet, syncData.row);
+      }
+    } catch (err) {
+      Logger.log(`Error processing queued calendar sync ${key}: ${err.message}`);
     } finally {
       props.deleteProperty(key);
     }
@@ -518,8 +550,212 @@ function recordEmailSent(row, sheetName, action) {
 }
 
 // ==========================================
-// 📅 CALENDAR SCHEDULING
+// 📅 CALENDAR SCHEDULING & AUTO-MATCHING
 // ==========================================
+
+/**
+ * Queues a row for background calendar matching.
+ */
+function queueCalendarSync(sheetName, row, email) {
+  if (!email || !String(email).includes('@')) return;
+  const props = PropertiesService.getScriptProperties();
+  const key = `PENDING_CAL_SYNC|${sheetName}|${row}`;
+  props.setProperty(key, JSON.stringify({
+    sheetName: sheetName,
+    row: row,
+    email: String(email).trim(),
+    timestamp: new Date().getTime()
+  }));
+}
+
+/**
+ * Searches the BD calendar for an event matching the row's contact email.
+ * If found, writes the event date/time as a rich-text hyperlink into Column I.
+ * If not found, leaves Column I untouched.
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @param {number} row
+ * @param {GoogleAppsScript.Calendar.CalendarEvent[]} [preloadedEvents] Optional list of events for batch speed
+ * @returns {boolean} True if matched and updated, false otherwise.
+ */
+function syncMeetingTimeFromCalendar(sheet, row, preloadedEvents) {
+  if (!sheet || row < 2) return false;
+
+  const email = String(sheet.getRange(row, CONFIG.emailColumn).getValue() || '').trim();
+  if (!email || !email.includes('@')) return false;
+
+  const runtimeConfig = getConfig();
+  const calendarId = runtimeConfig.calendarId;
+  if (!calendarId) {
+    Logger.log('syncMeetingTimeFromCalendar: CALENDAR_ID not set in Script Properties.');
+    return false;
+  }
+
+  const calendar = CalendarApp.getCalendarById(calendarId);
+  if (!calendar) {
+    Logger.log('syncMeetingTimeFromCalendar: Calendar not found for ID: ' + calendarId);
+    return false;
+  }
+
+  const now = new Date();
+  const targetEmail = email.toLowerCase();
+
+  // Helper to check if event matches the lead's email
+  function matchesLead(event) {
+    try {
+      const guests = event.getGuestList();
+      for (let i = 0; i < guests.length; i++) {
+        if (guests[i].getEmail().toLowerCase() === targetEmail) return true;
+      }
+    } catch (_) {}
+
+    try {
+      if (event.getTitle().toLowerCase().includes(targetEmail)) return true;
+    } catch (_) {}
+
+    try {
+      if (event.getDescription().toLowerCase().includes(targetEmail)) return true;
+    } catch (_) {}
+
+    return false;
+  }
+
+  let matchingEvents = [];
+
+  if (preloadedEvents && Array.isArray(preloadedEvents)) {
+    matchingEvents = preloadedEvents.filter(matchesLead);
+  } else {
+    // Search window: 7 days in past to 60 days in future
+    const startTime = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const endTime = new Date(now.getTime() + 60 * 24 * 60 * 60 * 1000);
+
+    try {
+      const searchResults = calendar.getEvents(startTime, endTime, { search: email });
+      matchingEvents = searchResults.filter(matchesLead);
+    } catch (err) {
+      Logger.log('Calendar search error: ' + err.message);
+    }
+
+    if (matchingEvents.length === 0) {
+      try {
+        const allEvents = calendar.getEvents(startTime, endTime);
+        matchingEvents = allEvents.filter(matchesLead);
+      } catch (err) {
+        Logger.log('Calendar fetch all events error: ' + err.message);
+      }
+    }
+  }
+
+  if (matchingEvents.length === 0) {
+    Logger.log(`No calendar event found for email "${email}" in row ${row}`);
+    return false;
+  }
+
+  // Pick best event: prefer upcoming future event (earliest first), otherwise most recent past event
+  matchingEvents.sort((a, b) => a.getStartTime().getTime() - b.getStartTime().getTime());
+  const futureEvents = matchingEvents.filter(e => e.getStartTime().getTime() >= now.getTime());
+  const chosenEvent = futureEvents.length > 0 ? futureEvents[0] : matchingEvents[matchingEvents.length - 1];
+
+  const eventStart = chosenEvent.getStartTime();
+  const rawId = chosenEvent.getId();
+  const cleanId = rawId.split('@')[0];
+
+  // Resolve link to event
+  let eventUrl = '';
+  try {
+    if (typeof Calendar !== 'undefined' && Calendar.Events && Calendar.Events.get) {
+      const advEvent = Calendar.Events.get(calendarId, cleanId);
+      if (advEvent && advEvent.htmlLink) {
+        eventUrl = advEvent.htmlLink;
+      }
+    }
+  } catch (_) {}
+
+  if (!eventUrl) {
+    const rawEid = cleanId + ' ' + calendarId;
+    const eid = Utilities.base64Encode(rawEid).replace(/=+$/, '');
+    eventUrl = 'https://calendar.google.com/calendar/event?eid=' + eid;
+  }
+
+  const ss = sheet.getParent();
+  const tz = ss.getSpreadsheetTimeZone() || Session.getScriptTimeZone() || 'Africa/Cairo';
+  const displayText = Utilities.formatDate(eventStart, tz, "MMM d, yyyy h:mm a");
+
+  const richText = SpreadsheetApp.newRichTextValue()
+    .setText(displayText)
+    .setLinkUrl(eventUrl)
+    .build();
+
+  sheet.getRange(row, CONFIG.dateColumn).setRichTextValue(richText);
+  logActivity('Meeting Time Linked', `${sheet.getName()} Row ${row} → ${displayText} (${email})`);
+  Logger.log(`Updated Row ${row} with meeting time: ${displayText} -> ${eventUrl}`);
+  return true;
+}
+
+/**
+ * Scans all active sheets for rows with a contact email but no meeting time,
+ * searches the BD calendar, and writes the meeting time and link.
+ */
+function bulkSyncMeetingTimes() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const runtimeConfig = getConfig();
+  const calendarId = runtimeConfig.calendarId;
+
+  if (!calendarId) {
+    ui.alert('❌ Error: CALENDAR_ID not set in Script Properties.');
+    return;
+  }
+
+  const calendar = CalendarApp.getCalendarById(calendarId);
+  if (!calendar) {
+    ui.alert('❌ Error: Calendar not found. Check permissions.');
+    return;
+  }
+
+  const now = new Date();
+  const startTime = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const endTime = new Date(now.getTime() + 60 * 24 * 60 * 60 * 1000);
+
+  // Pre-load all events in window once for fast batch comparison
+  let preloadedEvents = [];
+  try {
+    preloadedEvents = calendar.getEvents(startTime, endTime);
+  } catch (err) {
+    Logger.log('Failed to pre-load calendar events: ' + err.message);
+  }
+
+  let scannedCount = 0;
+  let syncedCount = 0;
+
+  CONFIG.activeSheets.forEach(sheetName => {
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet || sheet.getLastRow() < 2) return;
+
+    const lastRow = sheet.getLastRow();
+    const maxCol = Math.max(CONFIG.emailColumn, CONFIG.dateColumn);
+    const data = sheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
+
+    for (let i = 0; i < data.length; i++) {
+      const email = String(data[i][CONFIG.emailColumn - 1] || '').trim();
+      const dateVal = data[i][CONFIG.dateColumn - 1];
+
+      if (email && email.includes('@') && !dateVal) {
+        scannedCount++;
+        const rowNum = i + 2;
+        const matched = syncMeetingTimeFromCalendar(sheet, rowNum, preloadedEvents);
+        if (matched) syncedCount++;
+      }
+    }
+  });
+
+  ui.alert(
+    '🗓️ Calendar Sync Complete',
+    `Scanned ${scannedCount} lead(s) with missing meeting times.\n\n` +
+    `Successfully linked ${syncedCount} meeting(s) from your calendar.`,
+    ui.ButtonSet.OK
+  );
+}
 
 /**
  * Schedules meetings for all checked rows.
@@ -983,6 +1219,7 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('BD Meetings')
     .addItem('📅 Schedule Selected Meetings', 'scheduleSelectedMeetings')
+    .addItem('🗓️ Sync Meeting Times from Calendar', 'bulkSyncMeetingTimes')
     .addItem('🔍 Find All Duplicates', 'findAllDuplicates')
     .addItem('📊 View Activity Log', 'openActivityLog')
     .addItem('⚙️ Validate Settings', 'validateSettingsSheet')
