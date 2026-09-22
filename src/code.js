@@ -10,16 +10,16 @@
  */
 const CONFIG = {
   // Column mappings
-  openerColumn: 2,           // B - Opener name
-  moveTriggerColumn: 3,      // C - Move trigger dropdown
-  companyNameColumn: 5,      // E - Company name
-  authorizedPersonColumn: 6, // F - Contact person
-  phoneColumn: 7,            // G - Phone number
-  emailColumn: 8,            // H - Email address
-  dateColumn: 9,             // I - Meeting date/Meeting Time
-  notesColumn: 11,           // K - George's Notes (Email/Timestamp Trigger)
-  lastCallColumn: 13,        // M - Last Call (Timestamp Log)
-  checkboxColumn: 15,        // O - Schedule checkbox (Checkbox)
+  openerColumn:     4,       // B - Opener name
+  moveTriggerColumn:   5,    // C - Move trigger dropdown
+  companyNameColumn:    7,   // E - Company name
+  authorizedPersonColumn: 8,// F - Contact person
+  phoneColumn:     9,    // G - Phone number
+  emailColumn:      10,    // H - Email address
+  dateColumn:         11,  // I - Meeting date/Meeting Time
+  notesColumn:      13, // K - George's Notes (Email/Timestamp Trigger)
+  lastCallColumn:        15,// M - Last Call (Timestamp Log)
+  checkboxColumn:         17,// O - Schedule checkbox (Checkbox)
 
   emailThrottleMinutes: 5,
   settingsSheetName: "Settings",
