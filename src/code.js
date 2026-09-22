@@ -19,7 +19,8 @@ const CONFIG = {
   dateColumn:         11,  // I - Meeting date/Meeting Time
   notesColumn:      13, // K - George's Notes (Email/Timestamp Trigger)
   lastCallColumn:        15,// M - Last Call (Timestamp Log)
-  checkboxColumn:         17,// O - Schedule checkbox (Checkbox)
+  checkboxColumn:         17,// Q - Schedule checkbox (Checkbox)
+  npiColumn:              19,// S - NPI
 
   emailThrottleMinutes: 5,
   settingsSheetName: "Settings",
@@ -101,7 +102,7 @@ function onEdit(e) {
         const row = pasteStartRow + i;
         if (row === 1) continue; // skip header
         const val = pastedValues[i][colOffset];
-        if (val) queueRowMovement(e.range.getSheet().getName(), row, val);
+        if (val) queueRowMovement(e.range.getSheet().getName(), row, val, false);
       }
     }
 
@@ -127,7 +128,12 @@ function onEdit(e) {
   // Queue row movement IMMEDIATELY — before lock acquisition.
   // This ensures the key is written even if the lock wait below fails.
   if (col === CONFIG.moveTriggerColumn && val) {
-    queueRowMovement(editedSheet.getName(), row, val);
+    const confirmed = confirmRescheduledToNiMove(editedSheet.getName(), val);
+    if (!confirmed) {
+      editedRange.clearContent();
+      return;
+    }
+    queueRowMovement(editedSheet.getName(), row, val, true);
   }
 
   // Queue and trigger calendar match when Email (Col H) is entered/edited
@@ -169,7 +175,7 @@ function onEdit(e) {
 /**
  * Queues a row movement with a 10-second buffer (undo window)
  */
-function queueRowMovement(sheetName, row, dropdownValue) {
+function queueRowMovement(sheetName, row, dropdownValue, confirmed) {
   const props = PropertiesService.getScriptProperties();
   const key = `PENDING_MOVE|${sheetName}|${row}`;
 
@@ -177,6 +183,7 @@ function queueRowMovement(sheetName, row, dropdownValue) {
     sheetName: sheetName,
     row: row,
     dropdownValue: dropdownValue,
+    confirmed: confirmed === true,
     timestamp: new Date().getTime()
   };
 
@@ -245,6 +252,12 @@ function processQueuedMovements() {
 
       if (currentValue === storedValue) {
         const range = sheet.getRange(queueData.row, CONFIG.moveTriggerColumn);
+        if (isRescheduledToNiMove(sheet.getName(), currentValue) && queueData.confirmed !== true) {
+          safeAlert('⚠️ Move cancelled: a Rescheduled lead cannot be moved to NI without confirmation.');
+          range.clearContent();
+          cancelledCount++;
+          continue;
+        }
         handleRowMovement(sheet, range, ss, currentValue, destinationMap);
         processedCount++;
         Logger.log(`Processed queued move: ${queueData.sheetName} Row ${queueData.row}`);
@@ -252,6 +265,12 @@ function processQueuedMovements() {
         // FIX: Value changed but is still a valid move target — process it anyway
         Logger.log(`Value changed from "${storedValue}" to "${currentValue}" — still valid, processing.`);
         const range = sheet.getRange(queueData.row, CONFIG.moveTriggerColumn);
+        if (isRescheduledToNiMove(sheet.getName(), currentValue) && queueData.confirmed !== true) {
+          safeAlert('⚠️ Move cancelled: a Rescheduled lead cannot be moved to NI without confirmation.');
+          range.clearContent();
+          cancelledCount++;
+          continue;
+        }
         handleRowMovement(sheet, range, ss, currentValue, destinationMap);
         processedCount++;
       } else {
@@ -302,6 +321,30 @@ function safeAlert(message) {
     Logger.log('ALERT (no UI): ' + message);
   }
 }
+
+function isRescheduledToNiMove(sheetName, value) {
+  const source = String(sheetName || '').trim().toLowerCase();
+  const target = String(value || '').trim().toLowerCase();
+  return source === 'rescheduled' && (target === 'ni' || target === 'not interested');
+}
+
+function confirmRescheduledToNiMove(sheetName, value) {
+  if (!isRescheduledToNiMove(sheetName, value)) return true;
+
+  try {
+    const ui = SpreadsheetApp.getUi();
+    const result = ui.alert(
+      '⚠️ Confirm move to NI',
+      'This lead is Rescheduled. Moving it to NI means the meeting was never actually scheduled. Continue?',
+      ui.ButtonSet.YES_NO
+    );
+    return result === ui.Button.YES;
+  } catch (e) {
+    Logger.log('Rescheduled → NI confirmation requires a spreadsheet user: ' + e.message);
+    return false;
+  }
+}
+
 function handleRowMovement(sheet, range, ss, val, destinationMap) {
   // FIX #12: Only read Settings sheet if no map was passed in
   if (!destinationMap) {
@@ -671,15 +714,15 @@ function syncMeetingTimeFromCalendar(sheet, row, preloadedEvents) {
     }
   } catch (_) {}
 
-  if (!eventUrl) {
-    const rawEid = cleanId + ' ' + calendarId;
-    const eid = Utilities.base64Encode(rawEid).replace(/=+$/, '');
-    eventUrl = 'https://calendar.google.com/calendar/event?eid=' + eid;
-  }
+  // Always use the modern event-edit URL. Calendar API htmlLink values can
+  // still be returned in the legacy calendar/event format.
+  const rawEid = cleanId + ' ' + calendarId;
+  const eid = Utilities.base64EncodeWebSafe(rawEid).replace(/=+$/, '');
+  eventUrl = 'https://calendar.google.com/calendar/u/0/r/eventedit/' + eid;
 
   const ss = sheet.getParent();
   const tz = ss.getSpreadsheetTimeZone() || Session.getScriptTimeZone() || 'Africa/Cairo';
-  const displayText = Utilities.formatDate(eventStart, tz, "MMM d, yyyy h:mm a");
+  const displayText = Utilities.formatDate(eventStart, tz, "EEE h:mm a");
 
   const richText = SpreadsheetApp.newRichTextValue()
     .setText(displayText)
@@ -785,6 +828,22 @@ function scheduleSelectedMeetings() {
   for (let i = 1; i < data.length; i++) {
     const isChecked = data[i][CONFIG.checkboxColumn - 1] === true || String(data[i][CONFIG.checkboxColumn - 1]).toUpperCase() === "TRUE";
     const dateValue = data[i][CONFIG.dateColumn - 1];
+    const npi = String(data[i][CONFIG.npiColumn - 1] || '').replace(/\D/g, '');
+
+    if (dateValue && !isChecked) {
+      errors.push(`Row ${i + 1}: Meeting time exists, but the Schedule checkbox is not checked.`);
+      continue;
+    }
+
+    if (isChecked && npi.length !== 10) {
+      errors.push(`Row ${i + 1}: Schedule checkbox is checked, but the NPI field is missing or invalid.`);
+      continue;
+    }
+
+    if (isChecked && !dateValue) {
+      errors.push(`Row ${i + 1}: Schedule checkbox is checked, but the Meeting Time field is empty.`);
+      continue;
+    }
 
     if (isChecked && dateValue) {
       try {
@@ -1615,8 +1674,8 @@ function syncNpiToProspector() {
   }
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const NPI_COL    = 17; // Column Q
-  const SYNC_COL   = 18; // Column R
+  const NPI_COL    = 19; // Column S
+  const SYNC_COL   = 20; // Column T
   const OPENER_COL =  2; // Column B
   const COMPANY_COL = 5; // Column E
   const PHONE_COL  =  7; // Column G
