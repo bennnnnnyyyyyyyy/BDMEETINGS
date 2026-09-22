@@ -475,7 +475,7 @@ function enforceExpiredRescheduledRestrictions() {
   const sheet = ss.getSheetByName('New Meetings');
   if (!sheet || sheet.getLastRow() < 2) return;
 
-  const lastCol = Math.max(CONFIG.moveTriggerColumn, CONFIG.dateColumn, CONFIG.companyNameColumn);
+  const lastCol = Math.max(CONFIG.moveTriggerColumn, CONFIG.dateColumn, CONFIG.companyNameColumn, CONFIG.npiColumn);
   const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastCol).getValues();
   const now = new Date();
 
@@ -494,7 +494,55 @@ function enforceExpiredRescheduledRestrictions() {
     }
 
     restrictRescheduledNewMeetingRow(sheet, row);
+    emailExpiredRescheduledLead(sheet, row, rowData, meetingTime);
   });
+}
+
+function emailExpiredRescheduledLead(sheet, row, rowData, meetingTime) {
+  const runtimeConfig = getConfig();
+  const openerName = String(rowData[CONFIG.openerColumn - 1] || '').trim();
+  const openerEmail = runtimeConfig.openerEmails[openerName];
+
+  if (!openerName || !openerEmail) {
+    Logger.log(`Expired rescheduled notice skipped for row ${row}: opener email not configured.`);
+    return;
+  }
+
+  const npi = String(rowData[CONFIG.npiColumn - 1] || '').replace(/\D/g, '');
+  const noticeKey = `EXPIRED_RESCHEDULE_NOTICE|${npi || sheet.getName() + '|' + row}|${meetingTime.getTime()}`;
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(noticeKey)) return;
+
+  const company = String(rowData[CONFIG.companyNameColumn - 1] || '(No company name)');
+  const contact = String(rowData[CONFIG.authorizedPersonColumn - 1] || '(No contact)');
+  const tz = sheet.getParent().getSpreadsheetTimeZone() || Session.getScriptTimeZone() || 'Africa/Cairo';
+  const meetingLabel = Utilities.formatDate(meetingTime, tz, 'EEE h:mm a');
+  const subject = `BD MEETINGS: Rescheduled meeting time passed — ${company}`;
+  const body = [
+    `Hello ${openerName},`,
+    '',
+    `The rescheduled meeting time for ${company} has passed.`,
+    `Contact: ${contact}`,
+    `Meeting time: ${meetingLabel}`,
+    '',
+    'The lead remains in New Meetings and its next movement is now restricted to Cancelled.',
+    '',
+    `Open the spreadsheet: ${sheet.getParent().getUrl()}`
+  ].join('\n');
+
+  try {
+    MailApp.sendEmail({
+      to: openerEmail,
+      subject: subject,
+      body: body,
+      htmlBody: escapeHtml(body).replace(/\n/g, '<br>')
+    });
+    props.setProperty(noticeKey, new Date().toISOString());
+    logActivity('Expired Rescheduled Notice', `${sheet.getName()} Row ${row} → ${openerEmail}`);
+    Logger.log(`Expired rescheduled notice sent to ${openerEmail} for row ${row}`);
+  } catch (error) {
+    Logger.log(`Failed to send expired rescheduled notice for row ${row}: ${error.message}`);
+  }
 }
 /**
  * Returns true if a sheet should be SKIPPED in duplicate checks and batch movements.
