@@ -227,6 +227,10 @@ function queueRowMovement(sheetName, row, dropdownValue, confirmed) {
 // re-queue them as a "RETRY" so the backup picks them up.
 // ==========================================
 function processQueuedMovements() {
+  // Repair only rows that were restricted by the earlier immediate rule, then
+  // apply the intended time-based restriction for genuinely expired meetings.
+  restorePrematurelyRestrictedRescheduledRows();
+
   // Existing time-driven movement trigger also enforces the expired-meeting rule.
   enforceExpiredRescheduledRestrictions();
 
@@ -470,6 +474,50 @@ function restrictRescheduledNewMeetingRow(sheet, row) {
   logActivity('Rescheduled Lead Restricted', `${sheet.getName()} Row ${row} → Cancelled only`);
 }
 
+function isCancelledOnlyValidation(validation) {
+  if (!validation || validation.getCriteriaType() !== SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) return false;
+  const values = validation.getCriteriaValues();
+  return values && values[0] && values[0].length === 1 && String(values[0][0]) === 'Cancelled';
+}
+
+function getStandardStatusValidation(sheet) {
+  const lastRow = sheet.getLastRow();
+  for (let row = 2; row <= lastRow; row++) {
+    const validation = sheet.getRange(row, CONFIG.moveTriggerColumn).getDataValidation();
+    if (validation && !isCancelledOnlyValidation(validation)) return validation;
+  }
+  return null;
+}
+
+function restorePrematurelyRestrictedRescheduledRows() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('New Meetings');
+  if (!sheet || sheet.getLastRow() < 2) return;
+
+  const standardValidation = getStandardStatusValidation(sheet);
+  if (!standardValidation) {
+    Logger.log('Could not restore rescheduled statuses: no standard Status dropdown was found.');
+    return;
+  }
+
+  const lastCol = Math.max(CONFIG.moveTriggerColumn, CONFIG.dateColumn);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastCol).getValues();
+  const now = new Date();
+
+  rows.forEach((rowData, index) => {
+    const row = index + 2;
+    const cell = sheet.getRange(row, CONFIG.moveTriggerColumn);
+    if (String(cell.getValue() || '').trim() || !isCancelledOnlyValidation(cell.getDataValidation())) return;
+
+    const meetingTime = new Date(rowData[CONFIG.dateColumn - 1]);
+    if (!isNaN(meetingTime.getTime()) && meetingTime < now) return;
+
+    cell.setDataValidation(standardValidation);
+    cell.setValue('Rescheduled');
+    logActivity('Rescheduled Status Restored', `${sheet.getName()} Row ${row}`);
+  });
+}
+
 function enforceExpiredRescheduledRestrictions() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName('New Meetings');
@@ -487,11 +535,7 @@ function enforceExpiredRescheduledRestrictions() {
 
     const row = index + 2;
     const cell = sheet.getRange(row, CONFIG.moveTriggerColumn);
-    const validation = cell.getDataValidation();
-    if (validation && validation.getCriteriaType() === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
-      const values = validation.getCriteriaValues();
-      if (values && values[0] && values[0].length === 1 && String(values[0][0]) === 'Cancelled') return;
-    }
+    if (isCancelledOnlyValidation(cell.getDataValidation())) return;
 
     restrictRescheduledNewMeetingRow(sheet, row);
     emailExpiredRescheduledLead(sheet, row, rowData, meetingTime);
