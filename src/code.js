@@ -19,7 +19,7 @@ const CONFIG = {
   dateColumn:         11,  // I - Meeting date/Meeting Time
   notesColumn:      13, // K - George's Notes (Email/Timestamp Trigger)
   lastCallColumn:        15,// M - Last Call (Timestamp Log)
-  checkboxColumn:         17,// Q - Schedule checkbox (Checkbox)
+  checkboxColumn:         17,// Q - Sheet ↔ Prospector connection checkbox
   npiColumn:              19,// S - NPI
   qualificationCheckboxColumns: [1, 2, 3], // A-C - MEDB, PPO, SUB
 
@@ -149,11 +149,10 @@ function onEdit(e) {
 
   // Do not allow a lead to be marked for scheduling before its NPI is present.
   const isQualificationCheckbox = CONFIG.qualificationCheckboxColumns.indexOf(col) !== -1;
-  if ((col === CONFIG.checkboxColumn || isQualificationCheckbox) && isCheckboxChecked(editedRange.getValue())) {
+  if (isQualificationCheckbox && isCheckboxChecked(editedRange.getValue())) {
     const npi = String(editedSheet.getRange(row, CONFIG.npiColumn).getValue() || '').replace(/\D/g, '');
     if (npi.length !== 10) {
-      const fieldName = isQualificationCheckbox ? 'MEDB/PPO/SUB' : 'schedule';
-      safeAlert(`⚠️ NPI required: enter a valid 10-digit NPI before checking the ${fieldName} box.`);
+      safeAlert('⚠️ NPI required: enter a valid 10-digit NPI before checking the MEDB/PPO/SUB box.');
       editedRange.setValue(false);
       return;
     }
