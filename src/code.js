@@ -39,7 +39,8 @@ const CONFIG = {
     "Invoice Sent",
     "Dead Leads",
     "Temporary Inactive",
-    "Onboarded"
+    "Onboarded",
+    "Cancelled"
   ]
 };
 /**
@@ -380,7 +381,12 @@ function handleRowMovement(sheet, range, ss, val, destinationMap) {
   }
 
   const currentSheetName = sheet.getName();
-  if (currentSheetName === targetName) return;
+  if (currentSheetName === targetName) {
+    if (isRescheduledValue(val) && currentSheetName === 'New Meetings') {
+      restrictRescheduledNewMeetingRow(sheet, range.getRow());
+    }
+    return;
+  }
 
   const targetSheet = ss.getSheetByName(targetName);
   if (!targetSheet) {
@@ -421,6 +427,9 @@ function handleRowMovement(sheet, range, ss, val, destinationMap) {
 
   archiveDeletedRow(ss, currentSheetName, row, rowData);
   targetSheet.appendRow(rowData);
+  if (isRescheduledValue(val) && targetName === 'New Meetings') {
+    restrictRescheduledNewMeetingRow(targetSheet, targetSheet.getLastRow());
+  }
   sheet.deleteRow(row);
 
   logActivity('Row Moved', `${currentSheetName} → ${targetName} | Company: ${rowData[CONFIG.companyNameColumn - 1]}`);
@@ -445,8 +454,25 @@ function getDestinationMap() {
 
   // Built-in: Rescheduled always goes back to New Meetings
   if (!map['Rescheduled']) map['Rescheduled'] = 'New Meetings';
+  // Built-in: a rescheduled lead in New Meetings can only be moved to Cancelled.
+  if (!map['Cancelled']) map['Cancelled'] = 'Cancelled';
 
   return map;
+}
+
+function isRescheduledValue(value) {
+  return String(value || '').trim().toLowerCase() === 'rescheduled';
+}
+
+function restrictRescheduledNewMeetingRow(sheet, row) {
+  const cell = sheet.getRange(row, CONFIG.moveTriggerColumn);
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Cancelled'], true)
+    .setAllowInvalid(false)
+    .build();
+  cell.clearContent();
+  cell.setDataValidation(rule);
+  logActivity('Rescheduled Lead Restricted', `${sheet.getName()} Row ${row} → Cancelled only`);
 }
 /**
  * Returns true if a sheet should be SKIPPED in duplicate checks and batch movements.
@@ -1213,7 +1239,12 @@ function processBatchRowMovement() {
 
         if (triggerValue && destinationMap[triggerValue]) {
           const targetName = destinationMap[triggerValue];
-          if (sheetName === targetName) continue;
+          if (sheetName === targetName) {
+            if (isRescheduledValue(triggerValue) && sheetName === 'New Meetings') {
+              restrictRescheduledNewMeetingRow(sheet, i + 1);
+            }
+            continue;
+          }
 
           const targetSheet = ss.getSheetByName(targetName);
           if (!targetSheet) continue;
@@ -1251,6 +1282,9 @@ function processBatchRowMovement() {
 
           archiveDeletedRow(ss, sheetName, row, liveRowData);
           targetSheet.appendRow(liveRowData);
+          if (isRescheduledValue(triggerValue) && targetName === 'New Meetings') {
+            restrictRescheduledNewMeetingRow(targetSheet, targetSheet.getLastRow());
+          }
           sheet.deleteRow(row);
           movedCount++;
 
