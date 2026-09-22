@@ -227,6 +227,9 @@ function queueRowMovement(sheetName, row, dropdownValue, confirmed) {
 // re-queue them as a "RETRY" so the backup picks them up.
 // ==========================================
 function processQueuedMovements() {
+  // Existing time-driven movement trigger also enforces the expired-meeting rule.
+  enforceExpiredRescheduledRestrictions();
+
   const props = PropertiesService.getScriptProperties();
   const allProps = props.getProperties();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -381,12 +384,7 @@ function handleRowMovement(sheet, range, ss, val, destinationMap) {
   }
 
   const currentSheetName = sheet.getName();
-  if (currentSheetName === targetName) {
-    if (isRescheduledValue(val) && currentSheetName === 'New Meetings') {
-      restrictRescheduledNewMeetingRow(sheet, range.getRow());
-    }
-    return;
-  }
+  if (currentSheetName === targetName) return;
 
   const targetSheet = ss.getSheetByName(targetName);
   if (!targetSheet) {
@@ -427,9 +425,6 @@ function handleRowMovement(sheet, range, ss, val, destinationMap) {
 
   archiveDeletedRow(ss, currentSheetName, row, rowData);
   targetSheet.appendRow(rowData);
-  if (isRescheduledValue(val) && targetName === 'New Meetings') {
-    restrictRescheduledNewMeetingRow(targetSheet, targetSheet.getLastRow());
-  }
   sheet.deleteRow(row);
 
   logActivity('Row Moved', `${currentSheetName} → ${targetName} | Company: ${rowData[CONFIG.companyNameColumn - 1]}`);
@@ -473,6 +468,33 @@ function restrictRescheduledNewMeetingRow(sheet, row) {
   cell.clearContent();
   cell.setDataValidation(rule);
   logActivity('Rescheduled Lead Restricted', `${sheet.getName()} Row ${row} → Cancelled only`);
+}
+
+function enforceExpiredRescheduledRestrictions() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('New Meetings');
+  if (!sheet || sheet.getLastRow() < 2) return;
+
+  const lastCol = Math.max(CONFIG.moveTriggerColumn, CONFIG.dateColumn, CONFIG.companyNameColumn);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastCol).getValues();
+  const now = new Date();
+
+  rows.forEach((rowData, index) => {
+    if (!isRescheduledValue(rowData[CONFIG.moveTriggerColumn - 1])) return;
+
+    const meetingTime = new Date(rowData[CONFIG.dateColumn - 1]);
+    if (isNaN(meetingTime.getTime()) || meetingTime >= now) return;
+
+    const row = index + 2;
+    const cell = sheet.getRange(row, CONFIG.moveTriggerColumn);
+    const validation = cell.getDataValidation();
+    if (validation && validation.getCriteriaType() === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+      const values = validation.getCriteriaValues();
+      if (values && values[0] && values[0].length === 1 && String(values[0][0]) === 'Cancelled') return;
+    }
+
+    restrictRescheduledNewMeetingRow(sheet, row);
+  });
 }
 /**
  * Returns true if a sheet should be SKIPPED in duplicate checks and batch movements.
@@ -1239,12 +1261,7 @@ function processBatchRowMovement() {
 
         if (triggerValue && destinationMap[triggerValue]) {
           const targetName = destinationMap[triggerValue];
-          if (sheetName === targetName) {
-            if (isRescheduledValue(triggerValue) && sheetName === 'New Meetings') {
-              restrictRescheduledNewMeetingRow(sheet, i + 1);
-            }
-            continue;
-          }
+          if (sheetName === targetName) continue;
 
           const targetSheet = ss.getSheetByName(targetName);
           if (!targetSheet) continue;
@@ -1282,9 +1299,6 @@ function processBatchRowMovement() {
 
           archiveDeletedRow(ss, sheetName, row, liveRowData);
           targetSheet.appendRow(liveRowData);
-          if (isRescheduledValue(triggerValue) && targetName === 'New Meetings') {
-            restrictRescheduledNewMeetingRow(targetSheet, targetSheet.getLastRow());
-          }
           sheet.deleteRow(row);
           movedCount++;
 
