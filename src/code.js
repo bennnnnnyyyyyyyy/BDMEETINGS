@@ -146,6 +146,16 @@ function onEdit(e) {
     }
   }
 
+  // Do not allow a lead to be marked for scheduling before its NPI is present.
+  if (col === CONFIG.checkboxColumn && isCheckboxChecked(editedRange.getValue())) {
+    const npi = String(editedSheet.getRange(row, CONFIG.npiColumn).getValue() || '').replace(/\D/g, '');
+    if (npi.length !== 10) {
+      safeAlert('⚠️ NPI required: enter a valid 10-digit NPI before checking the schedule box.');
+      editedRange.setValue(false);
+      return;
+    }
+  }
+
   // Now acquire lock for the rest of the work
   const lock = LockService.getScriptLock();
   try {
@@ -320,6 +330,10 @@ function safeAlert(message) {
     // Running from a time-driven trigger — UI not available, log instead
     Logger.log('ALERT (no UI): ' + message);
   }
+}
+
+function isCheckboxChecked(value) {
+  return value === true || String(value).trim().toUpperCase() === 'TRUE';
 }
 
 function isRescheduledToNiMove(sheetName, value) {
