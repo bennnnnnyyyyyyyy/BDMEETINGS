@@ -1435,6 +1435,7 @@ function onOpen() {
   ui.createMenu('BD Meetings')
     .addItem('📅 Schedule Selected Meetings', 'scheduleSelectedMeetings')
     .addItem('🗓️ Sync Meeting Times from Calendar', 'bulkSyncMeetingTimes')
+    .addItem('🔗 Check Prospector Sync', 'checkProspectorSyncStatus')
     .addItem('🔍 Find All Duplicates', 'findAllDuplicates')
     .addItem('📊 View Activity Log', 'openActivityLog')
     .addItem('⚙️ Validate Settings', 'validateSettingsSheet')
@@ -1448,6 +1449,74 @@ function onOpen() {
     .addSeparator()
     .addItem('ℹ️ About Row Movement Buffer', 'showBufferInfo')
     .addToUi();
+}
+
+/**
+ * Read-only check of claim and status/Last Call sync state for Prospector rows.
+ * This uses the same tabs, exclusions, headers, and signature cache as the sync.
+ */
+function checkProspectorSyncStatus() {
+  var ui = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+  var defaultUser = props.getProperty('PROSPECTOR_USER_DEFAULT') || '';
+  var sigs = {};
+  try { sigs = JSON.parse(props.getProperty('PROSPECTOR_SYNC_SIGS') || '{}'); } catch (e) { sigs = {}; }
+
+  var sheetsToCheck = ['New Meetings', 'Follow Ups', 'Onboarded', 'Invoice Sent', 'Contract Sent', 'No-Show'];
+  var total = 0;
+  var synced = 0;
+  var pending = [];
+  var skipped = 0;
+  var warnings = [];
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  sheetsToCheck.forEach(function (sheetName) {
+    var sheet = ss.getSheetByName(sheetName);
+    if (!sheet || sheet.getLastRow() < 2) return;
+    var values = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues();
+    var col = prospectorColumns_(values[0]);
+    if (!col.npi || !col.sync) {
+      warnings.push(sheetName + ': missing NPI or SYNC header');
+      return;
+    }
+
+    for (var i = 1; i < values.length; i++) {
+      var row = values[i];
+      var cell = function (c) { return c ? String(row[c - 1] === null || row[c - 1] === undefined ? '' : row[c - 1]).trim() : ''; };
+      var npi = cell(col.npi).replace(/\D/g, '');
+      if (npi.length !== 10) continue;
+
+      var rowNum = i + 1;
+      var already = row[col.sync - 1] === true || String(row[col.sync - 1]).toUpperCase() === 'TRUE';
+      var sub = cell(col.sub);
+      var opener = cell(col.opener);
+      if (sub.toLowerCase() === 'solar' || opener.toLowerCase() === 'george') { skipped++; continue; }
+
+      total++;
+      var dmeUser = opener ? props.getProperty('PROSPECTOR_USER_' + opener) : defaultUser;
+      var status = cell(col.status) || ({ 'Onboarded': 'Onboarded', 'Contract Sent': 'Contract Sent', 'Invoice Sent': 'Invoice Sent' })[sheetName] || '';
+      var lastCallAt = toIso_(col.lastCall ? row[col.lastCall - 1] : '');
+      var statusNeedsSync = Boolean(status || lastCallAt) && sigs[dmeUser + '|' + npi] !== status + '|' + (lastCallAt || '');
+      var reasons = [];
+
+      if (!dmeUser) reasons.push('no DME user');
+      if (!already) reasons.push('claim pending');
+      if (dmeUser && statusNeedsSync) reasons.push('status/Last Call pending');
+
+      if (reasons.length === 0) {
+        synced++;
+      } else {
+        pending.push(sheetName + ' row ' + rowNum + ' (' + npi + '): ' + reasons.join(', '));
+      }
+    }
+  });
+
+  var message = 'Checked ' + total + ' valid Prospector row(s).\n\n' +
+    (pending.length === 0 ? '✅ All eligible rows are synced.' : '⚠️ ' + pending.length + ' row(s) need attention.') +
+    '\nSynced: ' + synced + '\nSkipped exclusions: ' + skipped;
+  if (warnings.length) message += '\n\nWarnings:\n' + warnings.join('\n');
+  if (pending.length) message += '\n\nPending rows' + (pending.length > 25 ? ' (first 25)' : '') + ':\n' + pending.slice(0, 25).join('\n');
+  ui.alert('Prospector Sync Check', message, ui.ButtonSet.OK);
 }
 
 /**
