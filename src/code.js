@@ -1832,168 +1832,240 @@ function scheduleSecondTriggerBoot() {
  * Only the 6 active sales tabs are scanned.
  */
 function syncNpiToProspector() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) { Logger.log('Prospector sync: another run is in progress -- skipping'); return; }
+  try {
+    runProspectorSync_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function runProspectorSync_() {
   var props = PropertiesService.getScriptProperties();
   var workerUrl = (props.getProperty('PROSPECTOR_WORKER_URL') || '').replace(/\/$/, '');
-  if (!workerUrl) {
-    Logger.log('Prospector sync: PROSPECTOR_WORKER_URL not set -- skipping');
-    return;
-  }
-
   var botUsername = props.getProperty('PROSPECTOR_BOT_USERNAME');
   var botPassword = props.getProperty('PROSPECTOR_BOT_PASSWORD');
-  if (!botUsername || !botPassword) {
-    Logger.log('Prospector sync: PROSPECTOR_BOT_USERNAME / PROSPECTOR_BOT_PASSWORD not set -- skipping');
+  var defaultUser = props.getProperty('PROSPECTOR_USER_DEFAULT') || '';
+  if (!workerUrl || !botUsername || !botPassword) {
+    Logger.log('Prospector sync: missing PROSPECTOR_WORKER_URL / BOT_USERNAME / BOT_PASSWORD -- skipping');
     return;
   }
 
-  // Only these tabs feed into the prospector
-  var SYNC_SHEETS = [
-    'New Meetings',
-    'Follow Ups',
-    'Onboarded',
-    'Invoice Sent',
-    'Contract Sent',
-    'No-Show',
-  ];
+  var SYNC_SHEETS = ['New Meetings', 'Follow Ups', 'Onboarded', 'Invoice Sent', 'Contract Sent', 'No-Show'];
+  var CHUNK = 10;
+  var STATUS_CHUNK = 50;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var entries = [];
 
-  var ss          = SpreadsheetApp.getActiveSpreadsheet();
-  var NPI_COL     = 19; // Column S -- NPI
-  var SYNC_COL    = 20; // Column T -- checkbox: true = synced, empty = pending
-  var OPENER_COL  =  2; // Column B -- Opener name
-  var COMPANY_COL =  5; // Column E -- Company name
-  var PHONE_COL   =  7; // Column G -- Phone
-  var BATCH_COL   = Math.max(NPI_COL, SYNC_COL, OPENER_COL, COMPANY_COL, PHONE_COL);
-
-  // Collect pending rows grouped by opener name
-  var byOpener = {};
-
-  SYNC_SHEETS.forEach(function(sheetName) {
+  SYNC_SHEETS.forEach(function (sheetName) {
     var sheet = ss.getSheetByName(sheetName);
     if (!sheet || sheet.getLastRow() < 2) return;
+    var values = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues();
+    var col = prospectorColumns_(values[0]);
+    if (!col.npi || !col.sync) {
+      Logger.log('Prospector sync: "' + sheetName + '" has no NPI / SYNC header -- skipping tab');
+      return;
+    }
 
-    var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, BATCH_COL).getValues();
+    for (var i = 1; i < values.length; i++) {
+      var row = values[i];
+      var cell = function (c) { return c ? String(row[c - 1] === null || row[c - 1] === undefined ? '' : row[c - 1]).trim() : ''; };
+      var npi = cell(col.npi).replace(/\D/g, '');
+      if (npi.length !== 10) continue;
 
-    data.forEach(function(row, i) {
-      var npi    = String(row[NPI_COL - 1]    || '').trim().replace(/\D/g, '');
-      var synced = row[SYNC_COL - 1];           // checkbox: true = done
-      var opener = String(row[OPENER_COL - 1]  || '').trim();
+      var rowNum = i + 1;
+      var already = row[col.sync - 1] === true || String(row[col.sync - 1]).toUpperCase() === 'TRUE';
+      var setLog = function (msg) { if (col.log) sheet.getRange(rowNum, col.log).setValue(msg); };
 
-      if (npi.length !== 10) return;            // missing or invalid NPI
-      if (synced === true) return;              // checkbox already checked
-      if (!opener) return;                      // no opener to claim under
+      var sub = cell(col.sub);
+      var opener = cell(col.opener);
+      if (sub.toLowerCase() === 'solar') { if (!already) setLog('Skipped: Solar'); continue; }
+      if (opener.toLowerCase() === 'george') { if (!already) setLog('Skipped: George'); continue; }
 
-      var dmeUsername = props.getProperty('PROSPECTOR_USER_' + opener);
-      if (!dmeUsername) {
-        Logger.log('Prospector sync: no DME username for opener "' + opener + '" (NPI ' + npi + ') -- skipping');
+      var dmeUser = opener ? props.getProperty('PROSPECTOR_USER_' + opener) : defaultUser;
+      if (!dmeUser) {
+        if (!already) setLog(opener ? 'No DME user for opener "' + opener + '" (add PROSPECTOR_USER_' + opener + ')' : 'No opener and no default user');
+        continue;
+      }
+
+      var rawPhone = cell(col.phone);
+      var rawEmail = cell(col.email);
+      var phoneMatch = rawPhone.match(/\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/);
+      var emailMatch = rawEmail.match(/[^\s\/,;"]+@[^\s\/,;"]+\.[^\s\/,;"]+/);
+      var status = cell(col.status) || ({ 'Onboarded': 'Onboarded', 'Contract Sent': 'Contract Sent', 'Invoice Sent': 'Invoice Sent' })[sheetName] || '';
+      var lastCallAt = toIso_(col.lastCall ? row[col.lastCall - 1] : '');
+
+      var notes = [];
+      if (sub) notes.push('SUB: ' + sub);
+      if (opener) notes.push('Opener: ' + opener);
+      if (cell(col.authPerson)) notes.push('Authorized person: ' + cell(col.authPerson));
+      if (rawPhone && (!phoneMatch || phoneMatch[0] !== rawPhone)) notes.push('Phone (as written): ' + rawPhone);
+      if (rawEmail && (!emailMatch || emailMatch[0] !== rawEmail)) notes.push('Email (as written): ' + rawEmail);
+
+      entries.push({
+        sheet: sheet, rowNum: rowNum, syncCol: col.sync, logCol: col.log, npi: npi, dmeUser: dmeUser,
+        pending: !already, status: status, lastCallAt: lastCallAt,
+        company: {
+          npi: npi, name: cell(col.company), phone: phoneMatch ? phoneMatch[0] : '', email: emailMatch ? emailMatch[0] : '',
+          status: status, notes: notes.join('\n'), meetingOpenerNotes: cell(col.openerSummary),
+          contactSource: 'bd-meetings', sources: 'BD Meetings'
+        }
+      });
+    }
+  });
+
+  if (entries.length === 0) { Logger.log('Prospector sync: nothing to do'); return; }
+
+  var token = loginBot_(workerUrl, botUsername, botPassword);
+  if (!token) return;
+
+  var pending = entries.filter(function (e) { return e.pending; });
+  groupBy_(pending, 'dmeUser', function (dmeUser, items) {
+    for (var c = 0; c < items.length; c += CHUNK) {
+      var chunk = items.slice(c, c + CHUNK);
+      var seen = {}, companies = [];
+      chunk.forEach(function (it) { if (!seen[it.npi]) { seen[it.npi] = true; companies.push(it.company); } });
+      var data;
+      try {
+        data = postJson_(workerUrl + '/admin/claim-for-user', token, { username: dmeUser, companies: companies });
+      } catch (err) {
+        Logger.log('Prospector sync: claim failed for ' + dmeUser + ': ' + err.message);
+        chunk.forEach(function (it) { writeLog_(it, 'Sync error: ' + err.message); });
         return;
       }
 
-      if (!byOpener[opener]) byOpener[opener] = { dmeUsername: dmeUsername, rows: [] };
-      byOpener[opener].rows.push({
-        sheet:    sheet,
-        rowIndex: i + 2,  // 1-indexed sheet row
-        npi:      npi,
-        company:  String(row[COMPANY_COL - 1] || ''),
-        phone:    String(row[PHONE_COL - 1]   || ''),
+      var verdict = {};
+      (data.claimedNpis || []).forEach(function (n) { verdict[String(n)] = { ok: true, msg: 'Claimed in DME Desk' }; });
+      (data.alreadyClaimedNpis || []).forEach(function (n) { verdict[String(n)] = { ok: true, msg: 'Already owned' }; });
+      (data.blocked || []).forEach(function (b) { verdict[String(b.npi)] = { ok: false, msg: 'Blocked: owned by ' + (b.owners || []).join(', ') }; });
+      (data.heldForReview || []).forEach(function (h) { verdict[String(h.npi)] = { ok: false, msg: 'Held for admin review (possible duplicate)' }; });
+      (data.invalid || []).forEach(function (v) { verdict[String(v.npi)] = { ok: false, msg: 'Invalid: ' + (v.reason || 'not accepted') }; });
+
+      chunk.forEach(function (it) {
+        var v = verdict[it.npi] || { ok: false, msg: 'No result returned' };
+        if (v.ok) it.sheet.getRange(it.rowNum, it.syncCol).setValue(true);
+        it.claimed = v.ok;
+        writeLog_(it, v.msg);
       });
-    });
-  });
-
-  var openers = Object.keys(byOpener);
-  if (openers.length === 0) {
-    Logger.log('Prospector sync: no pending NPI rows found.');
-    return;
-  }
-
-  // Login once as the bot -- one token shared across all openers in this run
-  var token;
-  try {
-    var loginResp = UrlFetchApp.fetch(workerUrl + '/auth/login', {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify({ username: botUsername, password: botPassword }),
-      muteHttpExceptions: true,
-    });
-    var loginJson = JSON.parse(loginResp.getContentText());
-    if (!loginJson.success) throw new Error(loginJson.error || 'login failed');
-    token = loginJson.data.token;
-    Logger.log('Prospector sync: bot logged in successfully');
-  } catch (err) {
-    Logger.log('Prospector sync: bot login failed -- ' + err.message);
-    return;
-  }
-
-  openers.forEach(function(opener) {
-    var group       = byOpener[opener];
-    var rows        = group.rows;
-    var dmeUsername = group.dmeUsername;
-
-    var companies = rows.map(function(r) {
-      return {
-        npi:           r.npi,
-        name:          r.company,
-        phone:         r.phone,
-        contactSource: 'bd-meetings',
-        sources:       'BD Meetings',
-      };
-    });
-
-    var claimData;
-    try {
-      var claimResp = UrlFetchApp.fetch(workerUrl + '/admin/claim-for-user', {
-        method: 'post',
-        contentType: 'application/json',
-        headers: { Authorization: 'Bearer ' + token },
-        payload: JSON.stringify({ username: dmeUsername, companies: companies }),
-        muteHttpExceptions: true,
-      });
-      var claimJson = JSON.parse(claimResp.getContentText());
-      if (!claimJson.success) throw new Error(claimJson.error || 'claim failed');
-      claimData = claimJson.data || {};
-    } catch (err) {
-      Logger.log('Prospector sync: claim failed for "' + opener + '" (' + dmeUsername + '): ' + err.message);
-      return; // leave Column T empty -- will retry on next run
     }
-
-    var claimed      = (claimData.claimedNpis        || []).map(String);
-    var alreadyOwned = (claimData.alreadyClaimedNpis  || []).map(String);
-    var blocked      = (claimData.blocked             || []).map(function(b)  { return String(b.npi); });
-    var held         = (claimData.heldForReview       || []).map(function(h)  { return String(h.npi); });
-    var invalid      = (claimData.invalid             || []).map(function(iv) { return String(iv.npi); });
-
-    var done = {};
-    claimed.concat(alreadyOwned).forEach(function(npi) { done[npi] = true; });
-
-    Logger.log(
-      'Prospector sync [' + opener + ']: ' +
-      'claimed=' + claimed.length + ', ' +
-      'already_had=' + alreadyOwned.length + ', ' +
-      'blocked=' + blocked.length + ', ' +
-      'held=' + held.length + ', ' +
-      'invalid=' + invalid.length
-    );
-
-    // Tick the checkbox for rows now in DME Desk.
-    // Leave blocked / held / invalid empty -- they need review or will retry.
-    rows.forEach(function(r) {
-      if (done[r.npi]) {
-        r.sheet.getRange(r.rowIndex, SYNC_COL).setValue(true);
-      }
-    });
   });
+
+  var props2 = PropertiesService.getScriptProperties();
+  var sigs = {};
+  try { sigs = JSON.parse(props2.getProperty('PROSPECTOR_SYNC_SIGS') || '{}'); } catch (e) { sigs = {}; }
+
+  var toSend = entries.filter(function (e) {
+    if (e.pending && !e.claimed) return false;
+    if (!e.status && !e.lastCallAt) return false;
+    return sigs[e.dmeUser + '|' + e.npi] !== statusSig_(e);
+  });
+
+  groupBy_(toSend, 'dmeUser', function (dmeUser, items) {
+    for (var c = 0; c < items.length; c += STATUS_CHUNK) {
+      var chunk = items.slice(c, c + STATUS_CHUNK);
+      var seen = {}, leads = [];
+      chunk.forEach(function (it) {
+        if (seen[it.npi]) return;
+        seen[it.npi] = true;
+        leads.push({ npi: it.npi, status: it.status, lastCallAt: it.lastCallAt });
+      });
+
+      var data;
+      try {
+        data = postJson_(workerUrl + '/admin/sync-lead-status', token, { username: dmeUser, leads: leads });
+      } catch (err) {
+        Logger.log('Prospector sync: status sync failed for ' + dmeUser + ': ' + err.message);
+        continue;
+      }
+
+      var updated = {}, unchanged = {}, notOwned = {};
+      (data.updated || []).forEach(function (n) { updated[String(n)] = true; });
+      (data.unchanged || []).forEach(function (n) { unchanged[String(n)] = true; });
+      (data.notOwned || []).forEach(function (n) { notOwned[String(n)] = true; });
+
+      chunk.forEach(function (it) {
+        if (updated[it.npi] || unchanged[it.npi]) {
+          sigs[it.dmeUser + '|' + it.npi] = statusSig_(it);
+          if (updated[it.npi] && !it.pending) writeLog_(it, 'Status synced: ' + it.status);
+        } else if (notOwned[it.npi]) {
+          writeLog_(it, 'Not synced: this lead is owned by someone else in DME Desk');
+        }
+      });
+    }
+  });
+  props2.setProperty('PROSPECTOR_SYNC_SIGS', JSON.stringify(sigs));
 }
 
-/**
- * One-time setup: creates the 30-minute time-driven trigger for syncNpiToProspector.
- * Run manually once from the Apps Script editor.
- */
-function setupProspectorSyncTrigger() {
-  ScriptApp.getProjectTriggers().forEach(function(t) {
-    if (t.getHandlerFunction() === 'syncNpiToProspector') ScriptApp.deleteTrigger(t);
+function statusSig_(entry) { return entry.status + '|' + (entry.lastCallAt || ''); }
+
+function groupBy_(items, field, fn) {
+  var groups = {};
+  items.forEach(function (it) { (groups[it[field]] = groups[it[field]] || []).push(it); });
+  Object.keys(groups).forEach(function (k) { fn(k, groups[k]); });
+}
+
+function loginBot_(workerUrl, username, password) {
+  try {
+    var resp = UrlFetchApp.fetch(workerUrl + '/auth/login', {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({ username: username, password: password }), muteHttpExceptions: true
+    });
+    var json = JSON.parse(resp.getContentText());
+    if (!json.success) throw new Error(json.error || 'login failed');
+    return json.data.token;
+  } catch (err) {
+    Logger.log('Prospector sync: bot login failed -- ' + err.message);
+    return null;
+  }
+}
+
+function postJson_(url, token, body) {
+  var resp = UrlFetchApp.fetch(url, {
+    method: 'post', contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + token }, payload: JSON.stringify(body), muteHttpExceptions: true
   });
-  ScriptApp.newTrigger('syncNpiToProspector')
-    .timeBased()
-    .everyMinutes(30)
-    .create();
-  SpreadsheetApp.getUi().alert('Prospector sync trigger created (runs every 30 minutes).');
+  var json;
+  try { json = JSON.parse(resp.getContentText()); } catch (e) { throw new Error('HTTP ' + resp.getResponseCode()); }
+  if (!json.success) throw new Error(json.error || ('HTTP ' + resp.getResponseCode()));
+  return json.data || {};
+}
+
+function toIso_(value) {
+  if (value === '' || value === null || value === undefined) return '';
+  var d = value instanceof Date ? value : new Date(value);
+  return isNaN(d.getTime()) ? '' : d.toISOString();
+}
+
+function writeLog_(item, msg) {
+  if (item.logCol) item.sheet.getRange(item.rowNum, item.logCol).setValue(msg);
+}
+
+function setupProspectorSyncTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'syncNpiToProspector' && t.getEventType() === ScriptApp.EventType.CLOCK) ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('syncNpiToProspector').timeBased().everyHours(2).create();
+  SpreadsheetApp.getUi().alert('Prospector sync trigger created (runs every 2 hours).');
+}
+
+function prospectorColumns_(headerRow) {
+  var map = {};
+  headerRow.forEach(function (h, idx) {
+    var t = String(h || '').trim().toLowerCase();
+    var c = idx + 1;
+    if (t === 'npi') map.npi = c;
+    else if (t === 'sync') map.sync = c;
+    else if (t === 'log') map.log = c;
+    else if (t === 'opener') map.opener = c;
+    else if (t === 'sub') map.sub = c;
+    else if (t === 'status') map.status = c;
+    else if (t === 'last call') map.lastCall = c;
+    else if (t === 'company name') map.company = c;
+    else if (t === 'authorized person') map.authPerson = c;
+    else if (t === 'phone') map.phone = c;
+    else if (t === 'email') map.email = c;
+    else if (t === 'opener summary') map.openerSummary = c;
+  });
+  return map;
 }
