@@ -1435,6 +1435,7 @@ function onOpen() {
   ui.createMenu('BD Meetings')
     .addItem('📅 Schedule Selected Meetings', 'scheduleSelectedMeetings')
     .addItem('🗓️ Sync Meeting Times from Calendar', 'bulkSyncMeetingTimes')
+    .addItem('🚀 Sync Prospector Now', 'syncNpiToProspector')
     .addItem('🔗 Check Prospector Sync', 'checkProspectorSyncStatus')
     .addItem('🔍 Find All Duplicates', 'findAllDuplicates')
     .addItem('📊 View Activity Log', 'openActivityLog')
@@ -1493,14 +1494,17 @@ function checkProspectorSyncStatus() {
       if (sub.toLowerCase() === 'solar' || opener.toLowerCase() === 'george') { skipped++; continue; }
 
       total++;
-      var dmeUser = opener ? props.getProperty('PROSPECTOR_USER_' + opener) : defaultUser;
+      var dmeUser = getProspectorUser_(props, opener, defaultUser);
       var status = cell(col.status) || ({ 'Onboarded': 'Onboarded', 'Contract Sent': 'Contract Sent', 'Invoice Sent': 'Invoice Sent' })[sheetName] || '';
       var lastCallAt = toIso_(col.lastCall ? row[col.lastCall - 1] : '');
+      var claimNeedsSync = !already;
       var statusNeedsSync = Boolean(status || lastCallAt) && sigs[dmeUser + '|' + npi] !== status + '|' + (lastCallAt || '');
       var reasons = [];
 
-      if (!dmeUser) reasons.push('no DME user');
-      if (!already) reasons.push('claim pending');
+      if (!dmeUser && (claimNeedsSync || statusNeedsSync)) {
+        reasons.push(opener ? 'no DME user for opener "' + opener + '"' : 'no DME user/default');
+      }
+      if (claimNeedsSync) reasons.push('claim pending');
       if (dmeUser && statusNeedsSync) reasons.push('status/Last Call pending');
 
       if (reasons.length === 0) {
@@ -1517,6 +1521,50 @@ function checkProspectorSyncStatus() {
   if (warnings.length) message += '\n\nWarnings:\n' + warnings.join('\n');
   if (pending.length) message += '\n\nPending rows' + (pending.length > 25 ? ' (first 25)' : '') + ':\n' + pending.slice(0, 25).join('\n');
   ui.alert('Prospector Sync Check', message, ui.ButtonSet.OK);
+}
+
+// Prospector usernames are not passwords. These aliases keep the sync working
+// with the existing opener email mapping and with full names used in the sheet.
+var PROSPECTOR_USER_FALLBACKS_ = {
+  'Ben': 'ben.arthur.wiz@gmail.com',
+  'Ben Arthur': 'ben.arthur.wiz@gmail.com',
+  'Caroline': 'caroline.richards.wiz@gmail.com',
+  'Caroline Richards': 'caroline.richards.wiz@gmail.com',
+  'Grant': 'grant_holden',
+  'Grant Holden': 'grant_holden',
+  'Jasmine': 'jasmine.green.wiz@gmail.com',
+  'Jasmine Green': 'jasmine.green.wiz@gmail.com',
+  'Jane': 'kaity.james.wiz@gmail.com',
+  'Jimmy': 'jimmy.pearson.wiz@gmail.com',
+  'Jimmy Pearson': 'jimmy.pearson.wiz@gmail.com',
+  'Kaity': 'kaity.james.wiz@gmail.com',
+  'Kaity James': 'kaity.james.wiz@gmail.com',
+  'Nora': 'nora.atkins.wiz@gmail.com',
+  'Rick': 'rickk.nelson.wiz@gmail.com',
+  'Rick Nelson': 'rickk.nelson.wiz@gmail.com',
+  'Selene': 'selene.myles.wiz@gmail.com',
+  'Selene Myles': 'selene.myles.wiz@gmail.com'
+};
+
+function getProspectorUser_(props, opener, defaultUser) {
+  if (!opener) return defaultUser || '';
+  var direct = props.getProperty('PROSPECTOR_USER_' + opener);
+  if (direct) return direct;
+
+  var openerEmails = {};
+  try { openerEmails = JSON.parse(props.getProperty('OPENER_EMAILS') || '{}'); } catch (e) { openerEmails = {}; }
+  if (openerEmails[opener]) return openerEmails[opener];
+  if (PROSPECTOR_USER_FALLBACKS_[opener]) return PROSPECTOR_USER_FALLBACKS_[opener];
+  var wanted = opener.toLowerCase();
+  var keys = Object.keys(openerEmails);
+  for (var i = 0; i < keys.length; i++) {
+    if (keys[i].toLowerCase() === wanted) return openerEmails[keys[i]];
+  }
+  keys = Object.keys(PROSPECTOR_USER_FALLBACKS_);
+  for (var j = 0; j < keys.length; j++) {
+    if (keys[j].toLowerCase() === wanted) return PROSPECTOR_USER_FALLBACKS_[keys[j]];
+  }
+  return '';
 }
 
 /**
@@ -1952,7 +2000,7 @@ function runProspectorSync_() {
       if (sub.toLowerCase() === 'solar') { if (!already) setLog('Skipped: Solar'); continue; }
       if (opener.toLowerCase() === 'george') { if (!already) setLog('Skipped: George'); continue; }
 
-      var dmeUser = opener ? props.getProperty('PROSPECTOR_USER_' + opener) : defaultUser;
+      var dmeUser = getProspectorUser_(props, opener, defaultUser);
       if (!dmeUser) {
         if (!already) setLog(opener ? 'No DME user for opener "' + opener + '" (add PROSPECTOR_USER_' + opener + ')' : 'No opener and no default user');
         continue;
